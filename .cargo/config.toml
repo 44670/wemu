@@ -1,0 +1,12 @@
+[target.wasm32-unknown-unknown]
+rustflags = [
+    # wasm-ld does not use an ELF-style linker script. Reserve the identity
+    # guest window by placing Rust static data after 0x00010000..0x10010000.
+    # Do not pass --stack-first; the Rust stack must stay after static data.
+    # Fixed wasm memory: guest window plus 1 GiB Rust heap, no growth headroom.
+    "-C", "link-arg=--global-base=268500992",
+    "-C", "link-arg=--initial-memory=1342242816",
+    "-C", "link-arg=--max-memory=1342242816",
+    "-C", "link-arg=--export-memory",
+    "-C", "link-arg=--Map=target/wasm32-unknown-unknown/wemu.map",
+]

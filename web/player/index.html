@@ -1,0 +1,521 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#15756b">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-title" content="wemu">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="wemu-err-disp-report-url" content="/err_disp">
+    <meta name="robots" content="noindex">
+    <title>wemu</title>
+    <link rel="manifest" href="/manifest.webmanifest">
+    <link rel="icon" href="/icons/wemu-icon-192.png" type="image/png">
+    <link rel="apple-touch-icon" href="/icons/wemu-icon-180.png">
+    <script>
+      (() => {
+        const ua = navigator.userAgent || "";
+        const platform = navigator.platform || "";
+        const isIPad =
+          /iPad/.test(ua) ||
+          (platform === "MacIntel" && navigator.maxTouchPoints > 1);
+        const isIPhone = /iPhone|iPod/.test(ua);
+        const isiOS = isIPad || isIPhone;
+        const isStandalone =
+          navigator.standalone === true ||
+          window.matchMedia("(display-mode: standalone)").matches;
+        const needsInstallGuide = isiOS && !isStandalone;
+        window.__WEMU_IOS_INSTALL_REQUIRED = needsInstallGuide;
+        const root = document.documentElement;
+        root.classList.toggle("needs-ios-install", needsInstallGuide);
+        root.classList.toggle("ios-install-ipad", needsInstallGuide && isIPad);
+        root.classList.toggle("ios-install-iphone", needsInstallGuide && !isIPad);
+      })();
+    </script>
+    <style>
+      :root {
+        color-scheme: dark;
+        --green: #5bd17c;
+        --blue: #6aa7ff;
+        --red: #e06c6c;
+        --text: #f1f5f1;
+        --muted: #aeb8b1;
+        --line: #30383d;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        min-height: 100svh;
+        overflow: hidden;
+        background: #000;
+        color: var(--text);
+        font: 15px/1.4 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+
+      button {
+        font: inherit;
+        min-height: 42px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #20272c;
+        color: var(--text);
+        cursor: pointer;
+      }
+
+      button:disabled {
+        cursor: default;
+        opacity: 0.52;
+      }
+
+      button:focus-visible {
+        outline: 2px solid var(--blue);
+        outline-offset: 2px;
+      }
+
+      .player {
+        display: grid;
+        place-items: center;
+        width: 100vw;
+        min-height: 100svh;
+        padding: 14px;
+        background: #07090a;
+      }
+
+      .idle {
+        display: grid;
+        place-items: center;
+        width: min(100%, 520px);
+        padding: 24px;
+        text-align: center;
+      }
+
+      .idle h1 {
+        margin: 0 0 18px;
+        font-size: clamp(36px, 11vw, 72px);
+        line-height: 0.92;
+        letter-spacing: 0;
+      }
+
+      .idle p {
+        margin: 0 0 24px;
+        color: var(--muted);
+        font-size: 18px;
+      }
+
+      .error {
+        color: var(--red);
+      }
+
+      .load-button {
+        min-width: 220px;
+        min-height: 54px;
+        border-color: #75df90;
+        background: var(--green);
+        color: #07130a;
+        font-size: 18px;
+        font-weight: 760;
+      }
+
+      body.has-runtime .idle {
+        display: none;
+      }
+
+      body.has-runtime .player {
+        padding: 0;
+        background: #000;
+      }
+
+      canvas {
+        --screen-aspect: 1.333333;
+        --screen-ratio: 4 / 3;
+        display: none;
+        width: min(100vw, calc(100svh * var(--screen-aspect)));
+        height: min(100svh, calc(100vw / var(--screen-aspect)));
+        border: 0;
+        outline: 0;
+        background: #000;
+        image-rendering: pixelated;
+        touch-action: none;
+        user-select: none;
+        -webkit-user-select: none;
+        -webkit-touch-callout: none;
+      }
+
+      body.has-runtime canvas {
+        display: block;
+      }
+
+      progress {
+        position: fixed;
+        left: 0;
+        right: 0;
+        top: 0;
+        width: 100%;
+        height: 3px;
+        border: 0;
+        z-index: 5;
+      }
+
+      progress::-webkit-progress-bar {
+        background: transparent;
+      }
+
+      progress::-webkit-progress-value {
+        background: var(--green);
+      }
+
+      progress::-moz-progress-bar {
+        background: var(--green);
+      }
+
+      dialog {
+        width: min(560px, calc(100vw - 28px));
+        max-height: min(680px, calc(100vh - 44px));
+        max-height: min(680px, calc(100svh - 44px));
+        padding: 0;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #171c20;
+        color: var(--text);
+      }
+
+      dialog::backdrop {
+        background: rgba(0, 0, 0, 0.68);
+      }
+
+      .dialog-head {
+        padding: 18px 18px 12px;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .dialog-head h2 {
+        margin: 0;
+        font-size: 22px;
+        letter-spacing: 0;
+      }
+
+      .dialog-head p {
+        margin: 6px 0 0;
+        color: var(--muted);
+      }
+
+      .exe-choices {
+        display: grid;
+        gap: 8px;
+        max-height: 380px;
+        overflow: auto;
+        padding: 12px;
+      }
+
+      .exe-choice {
+        display: grid;
+        gap: 3px;
+        width: 100%;
+        min-height: 58px;
+        padding: 10px 12px;
+        text-align: left;
+      }
+
+      .exe-choice span {
+        min-width: 0;
+        overflow-wrap: anywhere;
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .dialog-actions {
+        display: flex;
+        gap: 8px;
+        justify-content: flex-end;
+        padding: 12px;
+        border-top: 1px solid var(--line);
+      }
+
+      .err-disp-dialog {
+        width: min(780px, calc(100vw - 28px));
+      }
+
+      .err-disp-body {
+        display: grid;
+        gap: 10px;
+        padding: 12px;
+      }
+
+      .err-disp-json {
+        max-height: min(460px, calc(100svh - 230px));
+        margin: 0;
+        overflow: auto;
+        padding: 12px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: #090c0e;
+        color: #d9f6e2;
+        font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        overflow-wrap: anywhere;
+        white-space: pre-wrap;
+      }
+
+      .err-disp-report-status {
+        min-height: 20px;
+        margin: 0;
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .ios-install-guide {
+        display: none;
+      }
+
+      html.needs-ios-install body {
+        min-height: 100svh;
+        overflow: auto;
+        overflow-x: hidden;
+        background: #f5f1e8;
+        color: #15211f;
+      }
+
+      html.needs-ios-install progress,
+      html.needs-ios-install .player,
+      html.needs-ios-install dialog {
+        display: none;
+      }
+
+      html.needs-ios-install .ios-install-guide {
+        display: grid;
+        min-height: 100svh;
+        padding: max(24px, env(safe-area-inset-top)) max(20px, env(safe-area-inset-right)) max(28px, env(safe-area-inset-bottom)) max(20px, env(safe-area-inset-left));
+        place-items: center;
+      }
+
+      .ios-install-panel {
+        display: grid;
+        gap: 22px;
+        width: min(520px, calc(100vw - 40px));
+        padding-block: 34px;
+      }
+
+      .ios-share-arrow {
+        display: none;
+        position: fixed;
+        z-index: 1;
+        width: min(32vw, 132px);
+        height: auto;
+        color: #15756b;
+        filter: drop-shadow(0 4px 10px rgba(10, 31, 27, 0.22));
+        pointer-events: none;
+      }
+
+      .ios-share-arrow-iphone {
+        right: max(54px, env(safe-area-inset-right));
+        bottom: max(0px, env(safe-area-inset-bottom));
+      }
+
+      .ios-share-arrow-ipad {
+        top: max(12px, env(safe-area-inset-top));
+        right: max(14px, env(safe-area-inset-right));
+      }
+
+      html.ios-install-iphone .ios-share-arrow-iphone {
+        display: block;
+      }
+
+      html.ios-install-ipad .ios-share-arrow-ipad {
+        display: block;
+      }
+
+      .ios-install-logo {
+        width: 68px;
+        height: 68px;
+        border-radius: 12px;
+        background: url("/icons/wemu-icon-192.png") center / cover no-repeat;
+        box-shadow: 0 14px 32px rgba(10, 31, 27, 0.18);
+      }
+
+      .ios-install-copy h1 {
+        margin: 0 0 12px;
+        color: #0b342f;
+        font-size: clamp(36px, 11vw, 58px);
+        line-height: 0.96;
+        letter-spacing: 0;
+      }
+
+      .ios-install-copy p {
+        margin: 0;
+        color: #45534f;
+        font-size: 18px;
+      }
+
+      .ios-install-steps {
+        display: grid;
+        gap: 12px;
+        margin: 0;
+        padding: 0;
+        list-style: none;
+      }
+
+      .ios-install-steps li {
+        display: grid;
+        grid-template-columns: 44px minmax(0, 1fr);
+        gap: 12px;
+        align-items: center;
+        min-height: 60px;
+        padding: 12px;
+        border: 1px solid #d8cec0;
+        border-radius: 8px;
+        background: #fffaf0;
+      }
+
+      .ios-install-step-icon {
+        display: grid;
+        width: 44px;
+        height: 44px;
+        place-items: center;
+        border-radius: 8px;
+        background: #e7f3f0;
+        color: #15756b;
+      }
+
+      .ios-install-step-icon svg {
+        width: 28px;
+        height: 28px;
+      }
+
+      .ios-install-step-text strong {
+        display: block;
+        min-width: 0;
+        overflow-wrap: anywhere;
+        color: #15211f;
+        font-size: 17px;
+      }
+
+      .ios-install-step-text span {
+        display: block;
+        min-width: 0;
+        margin-top: 2px;
+        color: #5d6965;
+        overflow-wrap: anywhere;
+      }
+
+      html.ios-install-iphone .ipad-only,
+      html.ios-install-ipad .iphone-only {
+        display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <main class="ios-install-guide" aria-labelledby="ios-install-title">
+      <svg class="ios-share-arrow ios-share-arrow-iphone" viewBox="0 0 120 120" fill="none" aria-hidden="true">
+        <path d="M12 18C48 34 86 70 108 108" stroke="currentColor" stroke-width="7" stroke-linecap="round"/>
+        <path d="M78 104L108 108L101 78" stroke="currentColor" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <svg class="ios-share-arrow ios-share-arrow-ipad" viewBox="0 0 120 120" fill="none" aria-hidden="true">
+        <path d="M12 104C50 90 86 50 108 12" stroke="currentColor" stroke-width="7" stroke-linecap="round"/>
+        <path d="M101 42L108 12L78 18" stroke="currentColor" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <section class="ios-install-panel">
+        <div class="ios-install-logo" aria-hidden="true"></div>
+        <div class="ios-install-copy">
+          <h1 id="ios-install-title">Add wemu to Home Screen</h1>
+          <p>On iPhone and iPad, wemu runs from the Home Screen app view.</p>
+        </div>
+        <ol class="ios-install-steps">
+          <li>
+            <span class="ios-install-step-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none">
+                <circle cx="7" cy="12" r="1.8" fill="currentColor"/>
+                <circle cx="12" cy="12" r="1.8" fill="currentColor"/>
+                <circle cx="17" cy="12" r="1.8" fill="currentColor"/>
+              </svg>
+            </span>
+            <span class="ios-install-step-text">
+              <strong>1. Open the browser menu</strong>
+              <span class="iphone-only">Tap the "..." button in the lower-right corner.</span>
+              <span class="ipad-only">Use the toolbar button the arrow points to.</span>
+            </span>
+          </li>
+          <li>
+            <span class="ios-install-step-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none">
+                <path d="M12 3v12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                <path d="m7 8 5-5 5 5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                <path d="M6 11H5a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-6a2 2 0 0 0-2-2h-1" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+              </svg>
+            </span>
+            <span class="ios-install-step-text">
+              <strong>2. Tap the Share button</strong>
+              <span>Look for the square with an upward arrow.</span>
+            </span>
+          </li>
+          <li>
+            <span class="ios-install-step-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none">
+                <rect x="5" y="5" width="14" height="14" rx="4" stroke="currentColor" stroke-width="2"/>
+                <path d="M12 9v6M9 12h6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+              </svg>
+            </span>
+            <span class="ios-install-step-text">
+              <strong>3. Choose Add to Home Screen</strong>
+              <span>Then open wemu from the new Home Screen icon.</span>
+            </span>
+          </li>
+        </ol>
+      </section>
+    </main>
+    <progress id="progress" max="1" value="0"></progress>
+    <main class="player">
+      <section class="idle">
+        <div>
+          <h1>wemu</h1>
+          <p><strong id="status">Loading player</strong><br><span id="statusDetail">Please wait</span></p>
+          <button id="idleLoadButton" class="load-button" type="button" disabled>Choose Game ZIP</button>
+        </div>
+      </section>
+      <canvas id="screen" width="640" height="480" tabindex="0" aria-label="wemu display"></canvas>
+      <input id="zipFile" type="file" accept=".zip,application/zip,application/x-zip-compressed" hidden>
+    </main>
+
+    <dialog id="exeDialog">
+      <div class="dialog-head">
+        <h2>Choose program</h2>
+        <p>More than one program was found in the ZIP.</p>
+      </div>
+      <div id="exeChoices" class="exe-choices"></div>
+      <div class="dialog-actions">
+        <button id="exeCancel" type="button">Cancel</button>
+      </div>
+    </dialog>
+
+    <dialog id="errDispDialog" class="err-disp-dialog">
+      <div class="dialog-head">
+        <h2 id="errDispTitle">err_disp</h2>
+        <p id="errDispSummary"></p>
+      </div>
+      <div class="err-disp-body">
+        <pre id="errDispJson" class="err-disp-json"></pre>
+        <p id="errDispReportStatus" class="err-disp-report-status"></p>
+      </div>
+      <div class="dialog-actions">
+        <button id="errDispReportButton" type="button">Report</button>
+        <button id="errDispClose" type="button">Close</button>
+      </div>
+    </dialog>
+
+    <script type="module">
+      if (window.__WEMU_IOS_INSTALL_REQUIRED) {
+        if ("serviceWorker" in navigator) {
+          window.addEventListener("load", () => {
+            navigator.serviceWorker.register("/sw.js").catch(() => {});
+          });
+        }
+      } else {
+        import("/wemu.js");
+      }
+    </script>
+  </body>
+</html>

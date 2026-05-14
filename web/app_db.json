@@ -1,0 +1,48 @@
+{
+  "schema": "wemu.app_db.v1",
+  "entry_schema": "wemu.appcompat.v1",
+  "apps": [
+    {
+      "schema": "wemu.appcompat.v1",
+      "id": "rich4",
+      "name": "Rich4",
+      "status": "active-target",
+      "updated": "2026-05-11",
+      "executables": [
+        {
+          "id": "main",
+          "filename": "rich4.exe",
+          "role": "primary"
+        }
+      ],
+      "launch": {
+        "executable": "main",
+        "cwd": "exe-parent"
+      },
+      "locale": {
+        "ansi_codepage": "big5"
+      },
+      "required_assets": [
+        {
+          "id": "media",
+          "type": "directory",
+          "name": "Media",
+          "required": true,
+          "purpose": "game-media",
+          "locator": "named-directory",
+          "mount": {
+            "drive": "D",
+            "device": "cdrom"
+          }
+        }
+      ],
+      "verification": {
+        "last_checked": null,
+        "method": "manual",
+        "evidence": []
+      },
+      "source": "app_db/rich4.md",
+      "summary": "Rich4 is an active compatibility target for legacy graphics, mouse input, timers, file mounting, and Traditional Chinese text paths."
+    }
+  ]
+}

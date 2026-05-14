@@ -1,0 +1,23 @@
+[package]
+name = "wemu"
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+debug = 1
+
+[features]
+default = []
+sdl2 = ["dep:sdl2"]
+wasm-dom = []
+
+[dependencies]
+sdl2 = { version = "0.38.0", optional = true }
+
+[lib]
+name = "wemu"
+path = "src/lib.rs"
+
+[[bin]]
+name = "wemu"
+path = "src/main.rs"
