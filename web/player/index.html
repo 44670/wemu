@@ -508,13 +508,13 @@
 
     <script type="module">
       if (window.__WEMU_IOS_INSTALL_REQUIRED) {
-        if ("serviceWorker" in navigator) {
-          window.addEventListener("load", () => {
-            navigator.serviceWorker.register("/sw.js").catch(() => {});
-          });
-        }
       } else {
         import("/wemu.js");
+      }
+    </script>
+    <script>
+      if ("serviceWorker" in navigator) {
+        navigator.serviceWorker.register("/sw.js");
       }
     </script>
   </body>

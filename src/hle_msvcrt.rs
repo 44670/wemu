@@ -1164,10 +1164,7 @@ fn hle_crt_fwrite(emu: &mut Emulator, _: &HleEntry) -> HleResult {
                     return HleResult::Retn(0);
                 }
                 FileWriteResult::Pending { key, offset, data } => {
-                    if let Some(entry) = emu.hle.async_vfs_entries.get_mut(&key) {
-                        entry.size = entry.size.max(offset.saturating_add(data.len() as u64));
-                        entry.writable = true;
-                    }
+                    emu.hle.note_async_vfs_write(&key, offset, data.len());
                     let request_id = emu.hle.begin_vfs_write(&key, offset, data);
                     return HleResult::Wait(HleWaitState::VfsWrite {
                         request_id,

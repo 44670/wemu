@@ -1,4 +1,5 @@
 include!("hle_base.rs");
+include!("hle_vfs.rs");
 include!("hle_helpers.rs");
 include!("hle_msvcrt.rs");
 include!("hle_winapi.rs");

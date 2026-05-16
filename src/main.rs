@@ -35,7 +35,7 @@ fn parse_mount(s: &str) -> Result<(char, PathBuf), Error> {
 
 fn usage() {
     eprintln!(
-        "usage: wemu --mount C:=/dir --cmdline C:\\game.exe [--arg VALUE] [--cwd C:\\path] [--frontend headless|sdl2] [--sdl-ws 127.0.0.1:8765] [--max-insns N] [--breakpoint 0xADDR] [--screenshot out.png] [--replay script.txt|inline:wait,1;key,ENTER] [--record script.txt] [--state-interval SECONDS] [--trace] [--trace-after N] [--debug-on-crash] [--strict-hle-imports]\n       default: cwd is the command-line executable parent, unlimited instructions, screenshot /tmp/wemu.png; debug builds enable strict HLE imports"
+        "usage: wemu --mount C:=/dir --cmdline C:\\game.exe [options]\n       wemu --zip game.zip [--cmdline C:\\mnt\\game.exe] [options]\n       options: [--arg VALUE] [--cwd C:\\path] [--frontend headless|sdl2] [--frontend-fps N] [--sdl-ws 127.0.0.1:8765] [--max-insns N] [--breakpoint 0xADDR] [--screenshot out.png] [--replay script.txt|inline:wait,1;key,ENTER] [--record script.txt] [--state-interval SECONDS] [--trace] [--trace-after N] [--debug-on-crash] [--strict-hle-imports]\n       default: ZIP contents mount under C:\\mnt, cwd is the executable parent, unlimited instructions, screenshot /tmp/wemu.png; debug builds enable strict HLE imports"
     );
 }
 
@@ -61,6 +61,12 @@ fn parse_args() -> Result<RunConfig, Error> {
                     .next()
                     .ok_or_else(|| Error::Cli("--mount needs C:=/path".to_string()))?;
                 cfg.mounts.push(parse_mount(&mount)?);
+            }
+            "--zip" => {
+                cfg.zip =
+                    Some(PathBuf::from(args.next().ok_or_else(|| {
+                        Error::Cli("--zip needs a path".to_string())
+                    })?));
             }
             "--cwd" => {
                 let cwd = args
@@ -124,6 +130,14 @@ fn parse_args() -> Result<RunConfig, Error> {
                 };
             }
             "--sdl2" => cfg.frontend = FrontendKind::Sdl2,
+            "--frontend-fps" => {
+                let n = args
+                    .next()
+                    .ok_or_else(|| Error::Cli("--frontend-fps needs a number".to_string()))?;
+                cfg.frontend_fps = n
+                    .parse::<u32>()
+                    .map_err(|e| Error::Cli(format!("invalid --frontend-fps {n}: {e}")))?;
+            }
             "--sdl-ws" => {
                 cfg.sdl_ws = Some(
                     args.next()
@@ -159,11 +173,18 @@ fn parse_args() -> Result<RunConfig, Error> {
         }
     }
 
-    if cfg.cmdline.is_none() {
+    if cfg.zip.is_some() && !cfg.mounts.is_empty() {
+        usage();
+        return Err(Error::Cli(
+            "--zip cannot be combined with --mount; put all ZIP-mounted files in the archive"
+                .to_string(),
+        ));
+    }
+    if cfg.zip.is_none() && cfg.cmdline.is_none() {
         usage();
         return Err(Error::Cli("--cmdline is required".to_string()));
     }
-    if cfg.mounts.is_empty() {
+    if cfg.zip.is_none() && cfg.mounts.is_empty() {
         usage();
         return Err(Error::Cli("--mount is required".to_string()));
     }

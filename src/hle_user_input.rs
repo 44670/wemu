@@ -421,7 +421,7 @@ fn hle_call_next_hook_ex(emu: &mut Emulator, _: &HleEntry) -> HleResult {
 }
 
 // BOOL PeekMessageA(MSG *msg, HWND hwnd, UINT min, UINT max, UINT remove)
-// Prefer input messages, then app messages, with SDL/timer rescheduling.
+// Prefer input messages, then app messages; never synchronously dispatch timers.
 fn hle_peek_message_a(emu: &mut Emulator, entry: &HleEntry) -> HleResult {
     let result = peek_message_impl(emu, entry, "PeekMessageA");
     debug_assert!(matches!(result, HleResult::Retn(20)));
@@ -436,49 +436,26 @@ fn hle_peek_message_w(emu: &mut Emulator, entry: &HleEntry) -> HleResult {
     result
 }
 
-fn peek_message_impl(emu: &mut Emulator, entry: &HleEntry, trace_name: &str) -> HleResult {
+fn peek_message_impl(emu: &mut Emulator, _: &HleEntry, trace_name: &str) -> HleResult {
     let out = arg(emu, 0);
-    let hwnd = arg(emu, 1);
-    let min = arg(emu, 2);
-    let max = arg(emu, 3);
+    let filter = MessageFilter::new(arg(emu, 1), arg(emu, 2), arg(emu, 3));
     let remove = arg(emu, 4);
-    if !has_matching_message(emu, hwnd, min, max) {
-        emu.reschedule_message_pump().hle();
+    if !emu.hle.has_matching_message(filter) {
+        emu.poll_frontend_events_no_timers().hle();
         if emu.stopped.is_some() {
             emu.hle.note_peek_message("none", remove, None);
             ret(emu, 0);
             return HleResult::Retn(20);
         }
     }
-    if !emu.hle.has_input_messages() && dispatch_due_mm_timer_callback(emu, entry, 20, 0) {
-        return HleResult::Retn(20);
-    }
-    let input_index = matching_message_index(emu, &emu.hle.input_messages, hwnd, min, max);
-    let app_index = if input_index.is_none() {
-        matching_message_index(emu, &emu.hle.app_messages, hwnd, min, max)
-    } else {
-        None
-    };
-    let message = input_index
-        .map(|index| (true, index, emu.hle.input_messages[index]))
-        .or_else(|| app_index.map(|index| (false, index, emu.hle.app_messages[index])));
-    if let Some((from_input, index, message)) = message {
-        let source = if from_input { "input" } else { "app" };
-        emu.hle.note_peek_message(source, remove, Some(message));
-        if out != 0 {
-            write_msg(emu, out, message);
-        }
-        emu.hle.note_generated_paint_delivered(message);
-        if (remove & 1) != 0 {
-            if from_input {
-                emu.hle.input_messages.remove(index);
-                emu.hle.note_removed_message(source, message);
-            } else if message.msg != 0x000f {
-                emu.hle.app_messages.remove(index);
-                emu.hle.note_removed_message(source, message);
-            } else {
-            }
-        }
+    if let Some(message) = poll_message(
+        emu,
+        out,
+        filter,
+        (remove & 1) != 0,
+        "input",
+        "app",
+    ) {
         if emu.trace {
             eprintln!(
                 "{} -> msg={:08x} hwnd={:08x} w={:08x} l={:08x}",

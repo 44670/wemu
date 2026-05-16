@@ -423,20 +423,22 @@ fn hle_release_semaphore(emu: &mut Emulator, _: &HleEntry) -> HleResult {
     HleResult::Retn(12)
 }
 
+fn live_sleep_wait(emu: &mut Emulator, ms: u32, arg_bytes: u32) -> HleResult {
+    let target = emu.delay_target(ms);
+    HleResult::Wait(HleWaitState::Timeout {
+        until_ms: target.until_ms(emu.guest_time_ms),
+        not_before_frame: target.eligible_frame(emu.current_scheduler_frame()),
+        ret_value: 0,
+        arg_bytes,
+    })
+}
+
 // void Sleep(DWORD ms)
-// Park live frontends until timeout, but service due WinMM callbacks covered by the sleep interval.
-fn hle_sleep(emu: &mut Emulator, entry: &HleEntry) -> HleResult {
+// Park live frontends until timeout, including Sleep(0) as a frame-yield.
+fn hle_sleep(emu: &mut Emulator, _: &HleEntry) -> HleResult {
     let ms = arg(emu, 0);
-    if dispatch_sleep_mm_timer_callback(emu, entry, ms, 4, 0) {
-        return HleResult::Retn(4);
-    }
-    if emu.has_live_frontend() && ms != 0 {
-        emu.refresh_guest_time();
-        return HleResult::Wait(HleWaitState::Timeout {
-            until_ms: emu.guest_time_ms.saturating_add(ms as u64),
-            ret_value: 0,
-            arg_bytes: 4,
-        });
+    if emu.has_live_frontend() {
+        return live_sleep_wait(emu, ms, 4);
     }
     flush_gdi_present_if_pending(emu).hle();
     ret(emu, 0);
@@ -444,49 +446,22 @@ fn hle_sleep(emu: &mut Emulator, entry: &HleEntry) -> HleResult {
 }
 
 // DWORD SleepEx(DWORD ms, BOOL alertable)
-// Park live frontends until timeout, service due WinMM callbacks, and report no APC completion.
-fn hle_sleep_ex(emu: &mut Emulator, entry: &HleEntry) -> HleResult {
+// Park live frontends until timeout, including zero-delay waits as frame-yields.
+fn hle_sleep_ex(emu: &mut Emulator, _: &HleEntry) -> HleResult {
     let ms = arg(emu, 0);
-    if dispatch_sleep_mm_timer_callback(emu, entry, ms, 8, 0) {
-        return HleResult::Retn(8);
-    }
-    if emu.has_live_frontend() && ms != 0 {
-        emu.refresh_guest_time();
-        return HleResult::Wait(HleWaitState::Timeout {
-            until_ms: emu.guest_time_ms.saturating_add(ms as u64),
-            ret_value: 0,
-            arg_bytes: 8,
-        });
+    if emu.has_live_frontend() {
+        return live_sleep_wait(emu, ms, 8);
     }
     flush_gdi_present_if_pending(emu).hle();
     ret(emu, 0);
     HleResult::Retn(8)
 }
 
-fn dispatch_sleep_mm_timer_callback(
-    emu: &mut Emulator,
-    entry: &HleEntry,
-    ms: u32,
-    hle_arg_bytes: u32,
-    hle_return_value: u32,
-) -> bool {
-    if ms == 0 {
-        return false;
-    }
-    emu.refresh_guest_time();
-    let until_ms = emu.guest_time_ms.saturating_add(ms as u64);
-    let Some(due_ms) = emu.hle.next_due_mm_timer_ms(until_ms) else {
-        return false;
-    };
-    emu.guest_time_ms = due_ms;
-    dispatch_due_mm_timer_callback(emu, entry, hle_arg_bytes, hle_return_value)
-}
-
 // BOOL WaitMessage(void)
 // Cooperatively wait until the thread message queue has input or app messages.
 fn hle_wait_message(emu: &mut Emulator, _: &HleEntry) -> HleResult {
     if !emu.hle.has_messages() {
-        emu.reschedule_message_pump().hle();
+        emu.poll_frontend_events_no_timers().hle();
         if emu.stopped.is_some() {
             ret(emu, 0);
             return HleResult::Retn(0);
@@ -500,9 +475,7 @@ fn hle_wait_message(emu: &mut Emulator, _: &HleEntry) -> HleResult {
 
     HleResult::Wait(HleWaitState::Message {
         out: 0,
-        hwnd: 0,
-        min: 0,
-        max: 0,
+        filter: MessageFilter::any(),
     })
 }
 
@@ -513,9 +486,17 @@ fn hle_time_set_event(emu: &mut Emulator, _: &HleEntry) -> HleResult {
     let callback = arg(emu, 2);
     let user = arg(emu, 3);
     let event = arg(emu, 4);
+    let target = emu.delay_target(delay);
     let id = emu
         .hle
-        .set_mm_timer(delay, callback, user, event, emu.guest_time_ms);
+        .set_mm_timer(
+            callback,
+            user,
+            event,
+            emu.guest_time_ms,
+            emu.current_scheduler_frame(),
+            target,
+        );
     ret(emu, id);
     HleResult::Retn(20)
 }

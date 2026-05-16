@@ -3,9 +3,12 @@ pub mod arena;
 pub mod backend;
 pub mod cpu;
 pub mod debugger;
+pub mod guest_path;
 pub mod hle;
 pub mod journal;
 pub mod memory;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod native_zip;
 pub mod pe;
 pub mod png;
 pub mod text_encoding;
@@ -17,11 +20,16 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use crate::guest_path::GuestPath;
+
 const HEADLESS_INSNS_PER_MS: u64 = 1000;
 const STATE_CHECK_INSNS: u64 = 1_024;
 const FRAME_DEADLINE_CHECK_INSNS: u64 = 4_096;
 #[cfg(not(target_arch = "wasm32"))]
 const LIVE_WAIT_SLEEP_MS: u64 = 8;
+const DEFAULT_FRONTEND_FPS: u32 = 60;
+const DEFAULT_SCREEN_WIDTH: u32 = 800;
+const DEFAULT_SCREEN_HEIGHT: u32 = 600;
 pub const DEFAULT_FRAME_TIMEOUT_MS: u32 = 1_000;
 
 #[cfg(target_arch = "wasm32")]
@@ -92,7 +100,7 @@ fn default_guest_exe_path(exe: &Path, c_root: &Path) -> Result<String> {
         return Err(Error::Cli("--cmdline is required".to_string()));
     }
     if let Some(raw) = path_as_guest_path(exe) {
-        return Ok(normalize_guest_path(&raw, 'C', "\\"));
+        return Ok(GuestPath::resolve(&raw, 'C', "\\").display_path());
     }
     let rel = path_relative_to_root(exe, c_root).unwrap_or_else(|| {
         exe.file_name()
@@ -137,60 +145,7 @@ fn first_command_line_token(command_line: &str) -> Option<String> {
 }
 
 fn guest_parent_dir(raw: &str, cwd_drive: char, cwd_path: &str) -> (char, String) {
-    let full = normalize_guest_path(raw, cwd_drive, cwd_path);
-    let drive = full
-        .as_bytes()
-        .first()
-        .copied()
-        .map(|byte| byte.to_ascii_uppercase() as char)
-        .unwrap_or(cwd_drive.to_ascii_uppercase());
-    let rest = if full.len() >= 2 && full.as_bytes()[1] == b':' {
-        &full[2..]
-    } else {
-        full.as_str()
-    };
-    let parent = rest.rfind('\\').map(|pos| &rest[..pos]).unwrap_or("\\");
-    let parent = if parent.is_empty() { "\\" } else { parent };
-    (drive, parent.to_string())
-}
-
-fn normalize_guest_path(raw: &str, cwd_drive: char, cwd_path: &str) -> String {
-    let path = raw.replace('/', "\\");
-    let mut drive = cwd_drive.to_ascii_uppercase();
-    let mut rest = path.as_str();
-    let absolute_drive = path.len() >= 2 && path.as_bytes()[1] == b':';
-    if absolute_drive {
-        drive = path.as_bytes()[0].to_ascii_uppercase() as char;
-        rest = &path[2..];
-    }
-
-    let mut parts = Vec::new();
-    if !rest.starts_with('\\') && !absolute_drive {
-        for part in cwd_path
-            .trim_start_matches('\\')
-            .split('\\')
-            .filter(|part| !part.is_empty())
-        {
-            parts.push(part.to_string());
-        }
-    }
-    for part in rest
-        .trim_start_matches('\\')
-        .split('\\')
-        .filter(|part| !part.is_empty() && *part != ".")
-    {
-        if part == ".." {
-            parts.pop();
-        } else {
-            parts.push(part.to_string());
-        }
-    }
-
-    if parts.is_empty() {
-        format!("{drive}:\\")
-    } else {
-        format!("{drive}:\\{}", parts.join("\\"))
-    }
+    GuestPath::resolve(raw, cwd_drive, cwd_path).parent_dir()
 }
 
 fn push_unique_path(out: &mut Vec<PathBuf>, path: PathBuf) {
@@ -284,6 +239,8 @@ fn path_as_guest_path(path: &Path) -> Option<String> {
 use backend::SdlBackend;
 use backend::{Backend, BackendEvent, HeadlessBackend};
 use cpu::{Cpu, Reg, StepOutcome};
+#[cfg(test)]
+use hle::MessageFilter;
 use hle::{Hle, HleWaitState};
 use journal::{Journal, JournalEvent, JournalRecorder};
 use memory::{Memory, PagePerm, WriteContext, WriteRegisters};
@@ -385,6 +342,7 @@ fn decode_inline_journal(script: &str) -> String {
 #[derive(Clone, Debug)]
 pub struct RunConfig {
     pub exe: PathBuf,
+    pub zip: Option<PathBuf>,
     pub cmdline: Option<String>,
     pub args: Vec<String>,
     pub cwd_drive: char,
@@ -396,6 +354,7 @@ pub struct RunConfig {
     pub journal: Option<JournalInput>,
     pub record: Option<PathBuf>,
     pub frontend: FrontendKind,
+    pub frontend_fps: u32,
     pub sdl_ws: Option<String>,
     pub trace: bool,
     pub trace_after: u64,
@@ -408,6 +367,7 @@ impl Default for RunConfig {
     fn default() -> Self {
         Self {
             exe: PathBuf::new(),
+            zip: None,
             cmdline: None,
             args: Vec::new(),
             cwd_drive: 'C',
@@ -419,6 +379,7 @@ impl Default for RunConfig {
             journal: None,
             record: None,
             frontend: FrontendKind::Headless,
+            frontend_fps: DEFAULT_FRONTEND_FPS,
             sdl_ws: None,
             trace: false,
             trace_after: 0,
@@ -586,6 +547,7 @@ pub struct Emulator {
     pub recorder: Option<JournalRecorder>,
     pub guest_time_ms: u64,
     pub present_generation: u64,
+    scheduler_frame: u64,
     pub hle_tasks: Vec<HleTask>,
     current_hle_task: usize,
     ui_clock_start_ms: Option<u64>,
@@ -606,7 +568,10 @@ impl Emulator {
             memory: Memory::new(),
             cpu: Cpu::new(),
             hle: Hle::new(),
-            backend: Box::new(HeadlessBackend::new(640, 480)),
+            backend: Box::new(HeadlessBackend::new(
+                DEFAULT_SCREEN_WIDTH,
+                DEFAULT_SCREEN_HEIGHT,
+            )),
             image: None,
             insns: 0,
             max_insns: u64::MAX,
@@ -621,6 +586,7 @@ impl Emulator {
             recorder: None,
             guest_time_ms: 0,
             present_generation: 0,
+            scheduler_frame: 0,
             hle_tasks: vec![HleTask::new(1, Cpu::new())],
             current_hle_task: 0,
             ui_clock_start_ms: None,
@@ -655,9 +621,13 @@ impl Emulator {
             self.eip_history = EipHistory::from_env();
         }
         self.present_generation = 0;
+        self.scheduler_frame = 0;
         self.ui_clock_start_ms = None;
         self.memory.configure_write_watch_from_env()?;
         self.backend = create_backend(cfg.frontend, cfg.sdl_ws.as_deref())?;
+        if self.backend.uses_wall_clock() && cfg.frontend_fps != 0 {
+            self.set_frontend_timing(cfg.frontend_fps, 0);
+        }
         self.argv = cfg.args.clone();
         self.journal = if let Some(input) = &cfg.journal {
             input.load()?
@@ -676,6 +646,9 @@ impl Emulator {
         } else {
             None
         };
+        if cfg.zip.is_some() {
+            return Ok(());
+        }
 
         let default_root = default_mount_root(&cfg.exe)?;
         let c_root = cfg
@@ -693,7 +666,7 @@ impl Emulator {
             let token = first_command_line_token(cmdline).ok_or_else(|| {
                 Error::Cli("--cmdline must start with the guest executable path".to_string())
             })?;
-            normalize_guest_path(&token, cfg.cwd_drive, &cfg.cwd_path)
+            GuestPath::resolve(&token, cfg.cwd_drive, &cfg.cwd_path).display_path()
         } else {
             default_guest_exe_path(&cfg.exe, &c_root)?
         };
@@ -788,6 +761,67 @@ impl Emulator {
         let image = pe::load_pe32_bytes(exe.to_path_buf(), bytes, &mut self.memory, &mut self.hle)?;
         self.hle.check_strict_hle_imports()?;
         self.finish_load_exe(exe, image)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn load_zip_config(&mut self, cfg: &RunConfig) -> Result<()> {
+        let zip_path = cfg
+            .zip
+            .as_deref()
+            .ok_or_else(|| Error::Cli("--zip is required".to_string()))?;
+        let zip = native_zip::read_zip(zip_path)?;
+        if zip.exes.is_empty() {
+            return Err(Error::Cli(format!(
+                "ZIP {} has no .exe files",
+                zip_path.display()
+            )));
+        }
+
+        let selected_exe = if let Some(cmdline) = &cfg.cmdline {
+            let token = first_command_line_token(cmdline).ok_or_else(|| {
+                Error::Cli("--cmdline must start with the guest executable path".to_string())
+            })?;
+            GuestPath::resolve(&token, cfg.cwd_drive, &cfg.cwd_path).display_path()
+        } else if zip.exes.len() == 1 {
+            zip.exes[0].clone()
+        } else {
+            return Err(Error::Cli(format!(
+                "ZIP {} has multiple .exe files; pass --cmdline with one of:\n  {}",
+                zip_path.display(),
+                zip.exes.join("\n  ")
+            )));
+        };
+
+        let selected_key = self.hle.vfs_key_for_guest(&selected_exe);
+        let mut exe_bytes = None;
+        for file in zip.files {
+            let is_selected = self.hle.vfs_key_for_guest(&file.guest_path) == selected_key;
+            if is_selected {
+                exe_bytes = Some(file.data.clone());
+            }
+            self.hle.add_virtual_file_owned(&file.guest_path, file.data);
+        }
+        let exe_bytes = exe_bytes.ok_or_else(|| {
+            Error::Cli(format!(
+                "{} is not present in ZIP {}; available .exe files:\n  {}",
+                selected_exe,
+                zip_path.display(),
+                zip.exes.join("\n  ")
+            ))
+        })?;
+
+        self.apply_app_db_virtual_mounts_for_exe(&selected_exe);
+        if cfg.cwd_path.is_empty() {
+            let (cwd_drive, cwd_path) =
+                guest_parent_dir(&selected_exe, cfg.cwd_drive, &cfg.cwd_path);
+            self.hle.set_cwd(cwd_drive, cwd_path);
+        } else {
+            self.hle.set_cwd(cfg.cwd_drive, cfg.cwd_path.clone());
+        }
+        self.guest_module_file_name = selected_exe.clone();
+        let command_line = cfg.cmdline.clone().unwrap_or_else(|| selected_exe.clone());
+        self.guest_command_line = append_command_line_args(command_line, cfg.args.as_slice());
+        self.load_exe_bytes(Path::new(&selected_exe), &exe_bytes)
     }
 
     fn resolve_load_exe(&self, cfg: &RunConfig) -> Result<PathBuf> {
@@ -919,7 +953,7 @@ impl Emulator {
             self.maybe_print_state(false);
             if !self.backend.uses_wall_clock() {
                 self.refresh_guest_time();
-                self.hle.pump_timers(self.guest_time_ms);
+                self.hle.pump_timers(self.guest_time_ms, 0);
                 self.pump_journal();
                 self.wake_hle_tasks()?;
                 if let Some(reason) = self.handle_headless_wait()? {
@@ -945,7 +979,7 @@ impl Emulator {
             self.maybe_print_state(false);
             if !self.backend.uses_wall_clock() {
                 self.refresh_guest_time();
-                self.hle.pump_timers(self.guest_time_ms);
+                self.hle.pump_timers(self.guest_time_ms, 0);
                 self.pump_journal();
                 if hle::dispatch_due_mm_timer_interrupt(self) {
                     continue;
@@ -977,6 +1011,7 @@ impl Emulator {
 
         let frame_start_host_ms = host_time_ms();
         let hard_deadline_host_ms = frame_start_host_ms.saturating_add(timeout_ms as u64);
+        self.begin_scheduler_frame();
         self.hle.begin_frame();
         self.begin_frontend_frame()?;
         let start_present = self.present_generation;
@@ -1087,14 +1122,44 @@ impl Emulator {
         self.guest_time_ms = now.saturating_sub(start);
     }
 
-    pub fn reschedule_message_pump(&mut self) -> Result<()> {
-        self.service_guest()?;
+    pub fn set_frontend_timing(&mut self, fps: u32, microseconds_per_frame: u64) {
+        self.hle.set_frontend_timing(fps, microseconds_per_frame);
+    }
+
+    pub(crate) fn delay_target(&mut self, delay_ms: u32) -> hle::HleDelayTarget {
+        self.refresh_guest_time();
+        let scheduler_frame = if self.has_live_frontend() {
+            self.scheduler_frame
+        } else {
+            0
+        };
+        self.hle.delay_target(delay_ms, scheduler_frame)
+    }
+
+    pub fn poll_frontend_events_no_timers(&mut self) -> Result<()> {
+        self.refresh_guest_time();
+        if self.backend.wants_event_poll() {
+            if let Some(reason) = self.pump_backend_events()? {
+                self.stopped = Some(reason);
+            }
+        }
         self.maybe_print_state(true);
         Ok(())
     }
 
     pub fn has_live_frontend(&self) -> bool {
         self.backend.uses_wall_clock()
+    }
+
+    pub(crate) fn current_scheduler_frame(&self) -> u64 {
+        self.scheduler_frame
+    }
+
+    fn begin_scheduler_frame(&mut self) {
+        self.scheduler_frame = self.scheduler_frame.wrapping_add(1);
+        if self.scheduler_frame == 0 {
+            self.scheduler_frame = 1;
+        }
     }
 
     pub(crate) fn note_present(&mut self) {
@@ -1135,13 +1200,12 @@ impl Emulator {
     }
 
     fn wake_hle_tasks(&mut self) -> Result<()> {
-        let has_messages = self.hle.has_messages();
         let now_ms = self.guest_time_ms;
         let mut restore_current = false;
         for index in 0..self.hle_tasks.len() {
             match self.hle_tasks[index].wait {
                 HleWaitState::Ready => {}
-                HleWaitState::Message { .. } if has_messages => {
+                HleWaitState::Message { filter, .. } if self.hle.has_matching_message(filter) => {
                     self.hle_tasks[index].wait = HleWaitState::Ready;
                     restore_current |= index == self.current_hle_task;
                 }
@@ -1156,9 +1220,10 @@ impl Emulator {
                 HleWaitState::VfsRead { .. } | HleWaitState::VfsWrite { .. } => {}
                 HleWaitState::Timeout {
                     until_ms,
+                    not_before_frame,
                     ret_value,
                     arg_bytes,
-                } if now_ms >= until_ms => {
+                } if now_ms >= until_ms && self.scheduler_frame >= not_before_frame => {
                     self.complete_hle_timeout(index, ret_value, arg_bytes)?;
                     restore_current |= index == self.current_hle_task;
                 }
@@ -1303,7 +1368,8 @@ impl Emulator {
 
     fn service_guest(&mut self) -> Result<()> {
         self.refresh_guest_time();
-        self.hle.pump_timers(self.guest_time_ms);
+        self.hle
+            .pump_timers(self.guest_time_ms, self.scheduler_frame);
         self.pump_journal();
         self.wake_hle_tasks()?;
         if !self.current_hle_task_waiting() {
@@ -1457,8 +1523,22 @@ impl Emulator {
     pub fn run_config(cfg: &RunConfig) -> Result<(StopReason, Self)> {
         let mut emu = Self::new();
         emu.configure(cfg)?;
-        let exe = emu.resolve_load_exe(cfg)?;
-        emu.load_exe(&exe)?;
+        if cfg.zip.is_some() {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                emu.load_zip_config(cfg)?;
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                return Err(Error::Cli(
+                    "--zip is only supported by the native CLI; browser ZIPs are mounted by JavaScript"
+                        .to_string(),
+                ));
+            }
+        } else {
+            let exe = emu.resolve_load_exe(cfg)?;
+            emu.load_exe(&exe)?;
+        }
         let stop = if cfg.debug_on_crash {
             let old_panic_hook = std::panic::take_hook();
             std::panic::set_hook(Box::new(|_| {}));
@@ -1812,14 +1892,21 @@ pub(crate) fn write_registers(cpu: &Cpu) -> WriteRegisters {
 
 fn create_backend(frontend: FrontendKind, sdl_ws: Option<&str>) -> Result<Box<dyn Backend>> {
     match frontend {
-        FrontendKind::Headless => Ok(Box::new(HeadlessBackend::new(640, 480))),
+        FrontendKind::Headless => Ok(Box::new(HeadlessBackend::new(
+            DEFAULT_SCREEN_WIDTH,
+            DEFAULT_SCREEN_HEIGHT,
+        ))),
         FrontendKind::Sdl2 => create_sdl2_backend(sdl_ws),
     }
 }
 
 #[cfg(feature = "sdl2")]
 fn create_sdl2_backend(ws_addr: Option<&str>) -> Result<Box<dyn Backend>> {
-    Ok(Box::new(SdlBackend::new(640, 480, ws_addr)?))
+    Ok(Box::new(SdlBackend::new(
+        DEFAULT_SCREEN_WIDTH,
+        DEFAULT_SCREEN_HEIGHT,
+        ws_addr,
+    )?))
 }
 
 #[cfg(not(feature = "sdl2"))]
@@ -1863,6 +1950,7 @@ mod tests {
 
         let sleep = emu.hle.resolve_import("kernel32.dll", "Sleep");
         emu.cpu.eip = sleep;
+        emu.scheduler_frame = 3;
         assert_eq!(Hle::dispatch(&mut emu).unwrap(), None);
         assert!(matches!(
             emu.hle_tasks[0].wait,
@@ -1874,10 +1962,18 @@ mod tests {
         ));
         emu.hle_tasks[0].wait = HleWaitState::Timeout {
             until_ms: 0,
+            not_before_frame: 4,
             ret_value: 0,
             arg_bytes: 4,
         };
 
+        emu.service_frontend().unwrap();
+        assert!(matches!(
+            emu.hle_tasks[0].wait,
+            HleWaitState::Timeout { .. }
+        ));
+
+        emu.scheduler_frame = 4;
         emu.service_frontend().unwrap();
 
         assert!(emu.hle_tasks[0].wait.is_ready());
@@ -1887,11 +1983,151 @@ mod tests {
     }
 
     #[test]
+    fn live_sleep_zero_yields_until_next_frame() {
+        let mut emu = Emulator::new();
+        emu.backend = Box::new(HeadlessBackend::new_live(640, 480));
+        emu.memory
+            .map(TEST_STACK, 0x1000, PagePerm::READ | PagePerm::WRITE)
+            .unwrap();
+        emu.cpu.set_reg(Reg::Esp, TEST_STACK);
+        emu.memory.write_u32(TEST_STACK, 0x0040_0000).unwrap();
+        emu.memory.write_u32(TEST_STACK + 4, 0).unwrap();
+
+        let sleep = emu.hle.resolve_import("kernel32.dll", "Sleep");
+        emu.cpu.eip = sleep;
+        emu.scheduler_frame = 7;
+        assert_eq!(Hle::dispatch(&mut emu).unwrap(), None);
+        assert!(matches!(
+            emu.hle_tasks[0].wait,
+            HleWaitState::Timeout {
+                not_before_frame: 8,
+                ret_value: 0,
+                arg_bytes: 4,
+                ..
+            }
+        ));
+
+        emu.service_guest().unwrap();
+        assert!(matches!(
+            emu.hle_tasks[0].wait,
+            HleWaitState::Timeout { .. }
+        ));
+
+        emu.scheduler_frame = 8;
+        emu.service_guest().unwrap();
+        assert!(emu.hle_tasks[0].wait.is_ready());
+        assert_eq!(emu.cpu.eip, 0x0040_0000);
+        assert_eq!(emu.cpu.reg(Reg::Esp), TEST_STACK + 8);
+        assert_eq!(emu.cpu.reg(Reg::Eax), 0);
+    }
+
+    #[test]
+    fn live_sleep_ex_is_not_shortened_by_due_mm_timer() {
+        let mut emu = Emulator::new();
+        emu.backend = Box::new(HeadlessBackend::new_live(640, 480));
+        emu.set_frontend_timing(100, 10_000);
+        emu.memory
+            .map(TEST_STACK, 0x2000, PagePerm::READ | PagePerm::WRITE)
+            .unwrap();
+        emu.cpu.set_reg(Reg::Esp, TEST_STACK + 0x800);
+        emu.memory
+            .write_u32(TEST_STACK + 0x800, 0x0040_0000)
+            .unwrap();
+        emu.memory.write_u32(TEST_STACK + 0x804, 20).unwrap();
+        emu.memory.write_u32(TEST_STACK + 0x808, 0).unwrap();
+        emu.scheduler_frame = 1;
+        emu.ui_clock_start_ms = Some(host_time_ms());
+        let mm_target = emu.hle.delay_target(1, emu.scheduler_frame);
+        emu.hle
+            .set_mm_timer(0x0040_1f2d, 0xfeed, 1, 0, emu.scheduler_frame, mm_target);
+
+        let sleep_ex = emu.hle.resolve_import("kernel32.dll", "SleepEx");
+        emu.cpu.eip = sleep_ex;
+        assert_eq!(Hle::dispatch(&mut emu).unwrap(), None);
+        assert!(matches!(
+            emu.hle_tasks[0].wait,
+            HleWaitState::Timeout {
+                not_before_frame: 3,
+                ..
+            }
+        ));
+        assert_eq!(emu.cpu.eip, sleep_ex);
+        emu.hle_tasks[0].wait = HleWaitState::Timeout {
+            until_ms: 20,
+            not_before_frame: 3,
+            ret_value: 0,
+            arg_bytes: 8,
+        };
+
+        emu.guest_time_ms = 10;
+        emu.scheduler_frame = 2;
+        emu.wake_hle_tasks().unwrap();
+        assert!(matches!(
+            emu.hle_tasks[0].wait,
+            HleWaitState::Timeout { .. }
+        ));
+        assert_eq!(emu.cpu.eip, sleep_ex);
+
+        emu.guest_time_ms = 20;
+        emu.scheduler_frame = 3;
+        emu.wake_hle_tasks().unwrap();
+        assert!(emu.hle_tasks[0].wait.is_ready());
+        assert!(hle::dispatch_due_mm_timer_interrupt(&mut emu));
+        assert_eq!(emu.cpu.eip, 0x0040_1f2d);
+    }
+
+    #[test]
+    fn live_sleep_ex_is_not_shortened_by_due_user_timer() {
+        let mut emu = Emulator::new();
+        emu.backend = Box::new(HeadlessBackend::new_live(640, 480));
+        emu.set_frontend_timing(100, 10_000);
+        emu.memory
+            .map(TEST_STACK, 0x2000, PagePerm::READ | PagePerm::WRITE)
+            .unwrap();
+        emu.cpu.set_reg(Reg::Esp, TEST_STACK + 0x800);
+        emu.memory
+            .write_u32(TEST_STACK + 0x800, 0x0040_0000)
+            .unwrap();
+        emu.memory.write_u32(TEST_STACK + 0x804, 20).unwrap();
+        emu.memory.write_u32(TEST_STACK + 0x808, 0).unwrap();
+        emu.scheduler_frame = 1;
+        emu.ui_clock_start_ms = Some(host_time_ms());
+        let timer_target = emu.hle.delay_target(1, emu.scheduler_frame);
+        emu.hle
+            .set_timer(0, 1, 0, 0, emu.scheduler_frame, timer_target);
+
+        let sleep_ex = emu.hle.resolve_import("kernel32.dll", "SleepEx");
+        emu.cpu.eip = sleep_ex;
+        assert_eq!(Hle::dispatch(&mut emu).unwrap(), None);
+
+        emu.guest_time_ms = 10;
+        emu.scheduler_frame = 2;
+        emu.hle
+            .pump_timers(emu.guest_time_ms, emu.current_scheduler_frame());
+        emu.wake_hle_tasks().unwrap();
+        assert!(matches!(
+            emu.hle_tasks[0].wait,
+            HleWaitState::Timeout { .. }
+        ));
+        assert!(emu
+            .hle
+            .has_matching_message(MessageFilter::new(0, 0x0113, 0x0113)));
+        assert_eq!(emu.cpu.eip, sleep_ex);
+
+        emu.guest_time_ms = 20;
+        emu.scheduler_frame = 3;
+        emu.wake_hle_tasks().unwrap();
+        assert!(emu.hle_tasks[0].wait.is_ready());
+        assert_eq!(emu.cpu.eip, 0x0040_0000);
+    }
+
+    #[test]
     fn ready_hle_task_prevents_global_waiting() {
         let mut emu = Emulator::new();
         emu.guest_time_ms = 100;
         emu.hle_tasks[0].wait = HleWaitState::Timeout {
             until_ms: 180,
+            not_before_frame: 0,
             ret_value: 0,
             arg_bytes: 0,
         };
@@ -1903,6 +2139,28 @@ mod tests {
         assert!(emu.select_ready_hle_task());
         assert_eq!(emu.current_hle_task, 1);
         assert_eq!(emu.cpu.eip, 0x0040_1234);
+    }
+
+    #[test]
+    fn message_wait_wakes_only_for_matching_filter() {
+        let mut emu = Emulator::new();
+        emu.hle_tasks[0].wait = HleWaitState::Message {
+            out: 0,
+            filter: MessageFilter::new(0, 0x0113, 0x0113),
+        };
+
+        emu.hle.post_key_down(b'A' as u32);
+        emu.wake_hle_tasks().unwrap();
+        assert!(matches!(
+            emu.hle_tasks[0].wait,
+            HleWaitState::Message { .. }
+        ));
+
+        let target = emu.hle.delay_target(1, 0);
+        emu.hle.set_timer(0, 1, 0, 0, 0, target);
+        emu.hle.pump_timers(1, 0);
+        emu.wake_hle_tasks().unwrap();
+        assert!(emu.hle_tasks[0].wait.is_ready());
     }
 
     #[test]
@@ -1923,7 +2181,8 @@ mod tests {
         let mut emu = Emulator::new();
         setup_get_message(&mut emu);
         emu.breakpoints.push(TEST_RET);
-        emu.hle.set_timer(0, 1, 10, 0, 0);
+        let target = emu.hle.delay_target(10, 0);
+        emu.hle.set_timer(0, 1, 0, 0, 0, target);
 
         let stop = emu.run().unwrap();
 

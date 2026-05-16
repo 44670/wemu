@@ -9,10 +9,13 @@ use std::sync::Once;
 
 use crate::arena::{ArenaAllocOptions, ArenaAllocation, GuestArena};
 use crate::cpu::Reg;
+use crate::guest_path::GuestPath;
 use crate::memory::{align_down, align_up, Memory, PagePerm, WriteContext, PAGE_SIZE};
 use crate::pe::PeImage;
 use crate::{write_registers, Emulator, Error, Result, StopReason};
 
+const MICROSECONDS_PER_MILLISECOND: u64 = 1_000;
+const MICROSECONDS_PER_SECOND: u64 = 1_000_000;
 const HLE_BASE: u32 = 0x7000_0000;
 const HLE_STRIDE: u32 = 0x10;
 const MODULE_BASE: u32 = 0x0010_0000;
@@ -110,7 +113,7 @@ macro_rules! trace_fs {
 macro_rules! trace_alloc {
     ($($arg:tt)*) => {{
         if hle_trace_enabled(HLE_TRACE_ALLOC) {
-            eprintln!($($arg)*);
+            log_create_file(format!($($arg)*));
         }
     }};
 }
@@ -118,7 +121,7 @@ macro_rules! trace_alloc {
 macro_rules! trace_ddraw {
     ($($arg:tt)*) => {{
         if hle_trace_enabled(HLE_TRACE_DDRAW) {
-            eprintln!($($arg)*);
+            log_create_file(format!($($arg)*));
         }
     }};
 }
@@ -126,7 +129,7 @@ macro_rules! trace_ddraw {
 macro_rules! trace_gdi {
     ($($arg:tt)*) => {{
         if hle_trace_enabled(HLE_TRACE_GDI) {
-            eprintln!($($arg)*);
+            log_create_file(format!($($arg)*));
         }
     }};
 }
@@ -136,9 +139,7 @@ pub enum HleWaitState {
     Ready,
     Message {
         out: u32,
-        hwnd: u32,
-        min: u32,
-        max: u32,
+        filter: MessageFilter,
     },
     VfsRead {
         request_id: u32,
@@ -159,6 +160,7 @@ pub enum HleWaitState {
     },
     Timeout {
         until_ms: u64,
+        not_before_frame: u64,
         ret_value: u32,
         arg_bytes: u32,
     },
@@ -171,9 +173,80 @@ impl HleWaitState {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MessageFilter {
+    pub hwnd: u32,
+    pub min: u32,
+    pub max: u32,
+}
+
+impl MessageFilter {
+    pub const fn new(hwnd: u32, min: u32, max: u32) -> Self {
+        Self { hwnd, min, max }
+    }
+
+    pub const fn any() -> Self {
+        Self {
+            hwnd: 0,
+            min: 0,
+            max: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HleResult {
     Retn(u32),
     Wait(HleWaitState),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HleDelayTarget {
+    pub delay_ms: u64,
+    pub frame_count: u64,
+}
+
+impl HleDelayTarget {
+    fn millisecond(delay_ms: u64) -> Self {
+        let delay_ms = delay_ms.max(1);
+        Self {
+            delay_ms,
+            frame_count: 0,
+        }
+    }
+
+    pub fn until_ms(self, now_ms: u64) -> u64 {
+        now_ms.saturating_add(self.delay_ms)
+    }
+
+    pub fn eligible_frame(self, scheduler_frame: u64) -> u64 {
+        if scheduler_frame == 0 || self.frame_count == 0 {
+            0
+        } else {
+            scheduler_frame.saturating_add(self.frame_count)
+        }
+    }
+}
+
+fn rounded_live_frame_count(delay_ms: u32, frame_us: u64) -> u64 {
+    debug_assert!(delay_ms != 0);
+    debug_assert!(frame_us != 0);
+    let delay_us = (delay_ms as u128).saturating_mul(MICROSECONDS_PER_MILLISECOND as u128);
+    let frame_us = frame_us as u128;
+    let divisor = frame_us.saturating_mul(2);
+    delay_us
+        .saturating_mul(2)
+        .saturating_add(frame_us)
+        .saturating_div(divisor)
+        .max(1)
+        .min(u64::MAX as u128) as u64
+}
+
+fn next_period_frame(scheduler_frame: u64, period_frames: u64) -> u64 {
+    if scheduler_frame == 0 || period_frames == 0 {
+        0
+    } else {
+        scheduler_frame.saturating_add(period_frames)
+    }
 }
 
 type HleCallback = fn(&mut Emulator, &HleEntry) -> HleResult;
@@ -204,20 +277,8 @@ pub struct Hle {
     missing_hle_reported: bool,
     missing_hle_report: String,
     strict_hle_imports: bool,
-    drives: [Option<PathBuf>; 26],
-    drive_devices: [DriveDevice; 26],
-    virtual_drive_present: [bool; 26],
-    virtual_drive_aliases: [Option<String>; 26],
-    cwd_drive: char,
-    cwd_path: String,
     handles: Vec<Option<Handle>>,
-    virtual_fs_enabled: bool,
-    virtual_files: HashMap<String, Rc<RefCell<Vec<u8>>>>,
-    async_vfs_entries: HashMap<String, AsyncVfsEntry>,
-    async_vfs_writable: bool,
-    next_vfs_request_id: u32,
-    pending_vfs_request: Option<PendingVfsRequest>,
-    completed_vfs_requests: Vec<CompletedVfsRequest>,
+    vfs: Vfs,
     named_kernel_objects: HashMap<String, NamedKernelObject>,
     modules: HashMap<String, u32>,
     module_images: HashMap<u32, PeImage>,
@@ -276,6 +337,8 @@ pub struct Hle {
     recent_message_type_pos: u32,
     paint_frame_token: u64,
     cooperative_idle: bool,
+    frontend_fps: u32,
+    frontend_microseconds_per_frame: u64,
     timers: Vec<Timer>,
     next_timer_id: u32,
     mm_timers: Vec<MmTimer>,
@@ -625,111 +688,8 @@ enum NamedKernelObject {
     FileMapping(Rc<RefCell<Vec<u8>>>),
 }
 
-struct FindEntry {
-    name: String,
-    attrs: u32,
-    size: u64,
-}
-
-enum VirtualOpen {
-    Opened(u32),
-    Failed(u32),
-    Miss,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum DriveDevice {
-    Fixed,
-    Cdrom,
-    Virtual,
-}
-
-impl DriveDevice {
-    fn from_app_db(value: &str) -> Self {
-        match value {
-            "cdrom" => Self::Cdrom,
-            "virtual" => Self::Virtual,
-            _ => Self::Fixed,
-        }
-    }
-
-    fn win32_drive_type(self, drive: char) -> u32 {
-        match self {
-            Self::Cdrom => 5,
-            Self::Fixed | Self::Virtual => {
-                if matches!(drive, 'A' | 'B') {
-                    2
-                } else {
-                    3
-                }
-            }
-        }
-    }
-
-    fn volume_name(self) -> &'static str {
-        match self {
-            Self::Cdrom => "WEMU_CD",
-            Self::Fixed | Self::Virtual => "WEMU",
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct AsyncVfsEntry {
-    size: u64,
-    writable: bool,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PendingVfsRequestKind {
-    Read,
-    Write,
-}
-
-struct PendingVfsRequest {
-    id: u32,
-    kind: PendingVfsRequestKind,
-    path: String,
-    offset: u64,
-    len: u32,
-    data: Vec<u8>,
-}
-
-pub(crate) struct CompletedVfsRequest {
-    pub(crate) id: u32,
-    pub(crate) status: u32,
-    pub(crate) transferred: u32,
-    pub(crate) data: Vec<u8>,
-}
-
 fn kernel_object_key(name: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_ascii_lowercase())
-}
-
-fn drive_index(drive: char) -> Option<usize> {
-    let drive = drive.to_ascii_uppercase();
-    drive.is_ascii_alphabetic().then_some(drive as usize - 'A' as usize)
-}
-
-fn parent_guest_key(key: &str) -> Option<String> {
-    let trimmed = key.trim_end_matches('\\');
-    if trimmed.len() <= 3 {
-        return None;
-    }
-    let index = trimmed.rfind('\\')?;
-    if index <= 2 {
-        Some(trimmed[..3].to_string())
-    } else {
-        Some(trimmed[..index].to_string())
-    }
-}
-
-fn join_guest_key(base: &str, child: &str) -> String {
-    if base.ends_with('\\') {
-        format!("{base}{child}")
-    } else {
-        format!("{base}\\{child}")
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -738,6 +698,28 @@ struct Message {
     msg: u32,
     wparam: u32,
     lparam: u32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MessageQueueKind {
+    Input,
+    App,
+}
+
+#[derive(Clone, Copy)]
+struct QueuedMessage {
+    kind: MessageQueueKind,
+    index: usize,
+    message: Message,
+}
+
+fn message_id_matches(msg: u32, min: u32, max: u32) -> bool {
+    (min == 0 && max == 0) || (msg >= min && msg <= max)
+}
+
+fn message_remove_on_pm_remove(message: Message) -> bool {
+    const WM_PAINT: u32 = 0x000f;
+    message.msg != WM_PAINT
 }
 
 #[derive(Clone, Copy)]
@@ -906,7 +888,9 @@ struct Timer {
     id: u32,
     proc: u32,
     period_ms: u64,
+    period_frames: u64,
     next_ms: u64,
+    eligible_frame: u64,
     due_count: u64,
     post_count: u64,
 }
@@ -918,7 +902,9 @@ struct MmTimer {
     user: u32,
     event: u32,
     period_ms: u64,
+    period_frames: u64,
     next_ms: u64,
+    eligible_frame: u64,
     due_count: u64,
     call_count: u64,
 }
@@ -1108,20 +1094,8 @@ impl Hle {
             missing_hle_reported: false,
             missing_hle_report: String::new(),
             strict_hle_imports: cfg!(debug_assertions),
-            drives: std::array::from_fn(|_| None),
-            drive_devices: [DriveDevice::Fixed; 26],
-            virtual_drive_present: [false; 26],
-            virtual_drive_aliases: std::array::from_fn(|_| None),
-            cwd_drive: 'C',
-            cwd_path: "\\".to_string(),
             handles: Vec::new(),
-            virtual_fs_enabled: false,
-            virtual_files: HashMap::new(),
-            async_vfs_entries: HashMap::new(),
-            async_vfs_writable: false,
-            next_vfs_request_id: 1,
-            pending_vfs_request: None,
-            completed_vfs_requests: Vec::new(),
+            vfs: Vfs::default(),
             named_kernel_objects: HashMap::new(),
             modules: HashMap::new(),
             module_images: HashMap::new(),
@@ -1180,6 +1154,8 @@ impl Hle {
             recent_message_type_pos: 0,
             paint_frame_token: 0,
             cooperative_idle: false,
+            frontend_fps: 0,
+            frontend_microseconds_per_frame: 0,
             timers: Vec::new(),
             next_timer_id: 1,
             mm_timers: Vec::new(),
@@ -1237,174 +1213,46 @@ impl Hle {
         hle
     }
 
-    pub fn set_drive_mount(&mut self, drive: char, path: PathBuf) {
-        if let Some(idx) = drive_index(drive) {
-            self.drives[idx] = Some(path);
-            self.virtual_drive_aliases[idx] = None;
-        }
-    }
-
-    pub fn set_drive_device(&mut self, drive: char, device: &str) {
-        if let Some(idx) = drive_index(drive) {
-            self.drive_devices[idx] = DriveDevice::from_app_db(device);
-        }
-    }
-
-    pub fn set_virtual_drive_alias(&mut self, drive: char, target: &str, device: &str) {
-        let Some(idx) = drive_index(drive) else {
-            return;
-        };
-        let mut key = self.guest_path_key_no_alias(target);
-        while key.ends_with('\\') && key.len() > 3 {
-            key.pop();
-        }
-        self.virtual_drive_aliases[idx] = Some(key);
-        self.drive_devices[idx] = DriveDevice::from_app_db(device);
-    }
-
-    pub fn drive_is_mounted(&self, drive: char) -> bool {
-        drive_index(drive).is_some_and(|idx| self.drive_mounted_at(idx))
-    }
-
-    fn drive_mounted_at(&self, idx: usize) -> bool {
-        self.drives[idx].is_some()
-            || self.virtual_drive_present[idx]
-            || self.virtual_drive_aliases[idx].is_some()
-    }
-
-    fn drive_device_at(&self, idx: usize) -> DriveDevice {
-        self.drive_devices[idx]
-    }
-
-    fn drive_type(&self, drive: char) -> Option<u32> {
-        let idx = drive_index(drive)?;
-        self.drive_mounted_at(idx)
-            .then(|| self.drive_device_at(idx).win32_drive_type((b'A' + idx as u8) as char))
-    }
-
-    fn drive_volume_name(&self, drive: char) -> &'static str {
-        drive_index(drive)
-            .map(|idx| self.drive_device_at(idx).volume_name())
-            .unwrap_or("WEMU")
-    }
-
-    pub fn find_virtual_named_directory_near(&self, guest_path: &str, name: &str) -> Option<String> {
-        let name = name.to_ascii_lowercase();
-        let mut dir = parent_guest_key(&self.guest_path_key_no_alias(guest_path))?;
-        loop {
-            let candidate = join_guest_key(&dir, &name);
-            if self.virtual_directory_exists_key(&candidate) {
-                return Some(candidate);
-            }
-            let Some(parent) = parent_guest_key(&dir) else {
-                break;
-            };
-            if parent == dir {
-                break;
-            }
-            dir = parent;
-        }
-        None
-    }
-
-    pub fn set_cwd(&mut self, drive: char, path: String) {
-        self.cwd_drive = drive.to_ascii_uppercase();
-        self.cwd_path = if path.is_empty() {
-            "\\".to_string()
+    pub fn set_frontend_timing(&mut self, fps: u32, microseconds_per_frame: u64) {
+        self.frontend_fps = fps;
+        self.frontend_microseconds_per_frame = if microseconds_per_frame != 0 {
+            microseconds_per_frame
+        } else if fps != 0 {
+            MICROSECONDS_PER_SECOND.saturating_add((fps / 2) as u64) / fps as u64
         } else {
-            path
+            0
         };
     }
 
-    pub fn host_path_for_guest(&self, raw: &str) -> Result<PathBuf> {
-        self.translate_raw_path(raw)
-    }
-
-    pub fn enable_virtual_fs(&mut self) {
-        self.virtual_fs_enabled = true;
-    }
-
-    pub fn add_virtual_file(&mut self, guest_path: &str, bytes: &[u8]) {
-        self.add_virtual_file_owned(guest_path, bytes.to_vec());
-    }
-
-    pub fn add_virtual_file_owned(&mut self, guest_path: &str, bytes: Vec<u8>) {
-        self.virtual_fs_enabled = true;
-        let key = self.guest_path_key_no_alias(guest_path);
-        self.mark_virtual_drive_present_for_key(&key);
-        let key = self.apply_virtual_drive_alias(key);
-        self.virtual_files.insert(key, Rc::new(RefCell::new(bytes)));
-    }
-
-    pub fn add_async_virtual_file(&mut self, guest_path: &str, size: u64, writable: bool) {
-        self.virtual_fs_enabled = true;
-        let key = self.guest_path_key_no_alias(guest_path);
-        self.mark_virtual_drive_present_for_key(&key);
-        let key = self.apply_virtual_drive_alias(key);
-        self.async_vfs_entries
-            .insert(key, AsyncVfsEntry { size, writable });
-    }
-
-    pub fn enable_async_vfs_writes(&mut self) {
-        self.virtual_fs_enabled = true;
-        self.async_vfs_writable = true;
-    }
-
-    pub fn pending_vfs_request_id(&self) -> u32 {
-        self.pending_vfs_request.as_ref().map_or(0, |req| req.id)
-    }
-
-    pub fn pending_vfs_request_kind(&self) -> u32 {
-        match self.pending_vfs_request.as_ref().map(|req| req.kind) {
-            Some(PendingVfsRequestKind::Read) => 1,
-            Some(PendingVfsRequestKind::Write) => 2,
-            None => 0,
+    pub fn delay_target(&self, delay_ms: u32, scheduler_frame: u64) -> HleDelayTarget {
+        if scheduler_frame == 0 {
+            return HleDelayTarget::millisecond(delay_ms as u64);
         }
-    }
 
-    pub fn pending_vfs_request_path(&self) -> &[u8] {
-        self.pending_vfs_request
-            .as_ref()
-            .map(|req| req.path.as_bytes())
-            .unwrap_or(&[])
-    }
+        let frame_us = self.frontend_microseconds_per_frame;
+        if frame_us == 0 {
+            return HleDelayTarget {
+                delay_ms: delay_ms as u64,
+                frame_count: 1,
+            };
+        }
 
-    pub fn pending_vfs_request_offset(&self) -> u64 {
-        self.pending_vfs_request.as_ref().map_or(0, |req| req.offset)
-    }
-
-    pub fn pending_vfs_request_len(&self) -> u32 {
-        self.pending_vfs_request.as_ref().map_or(0, |req| req.len)
-    }
-
-    pub fn pending_vfs_request_data(&self) -> &[u8] {
-        self.pending_vfs_request
-            .as_ref()
-            .map(|req| req.data.as_slice())
-            .unwrap_or(&[])
-    }
-
-    pub fn complete_vfs_request(
-        &mut self,
-        request_id: u32,
-        status: u32,
-        transferred: u32,
-        data: Vec<u8>,
-    ) -> bool {
-        let Some(req) = self.pending_vfs_request.take() else {
-            return false;
+        let frame_count = if delay_ms == 0 {
+            1
+        } else {
+            rounded_live_frame_count(delay_ms, frame_us)
         };
-        if req.id != request_id {
-            self.pending_vfs_request = Some(req);
-            return false;
+        let rounded_us = (frame_count as u128).saturating_mul(frame_us as u128);
+        let effective_ms = if delay_ms == 0 {
+            0
+        } else {
+            ((rounded_us / MICROSECONDS_PER_MILLISECOND as u128).min(u64::MAX as u128) as u64)
+                .max(1)
+        };
+        HleDelayTarget {
+            delay_ms: effective_ms,
+            frame_count,
         }
-        self.completed_vfs_requests.push(CompletedVfsRequest {
-            id: request_id,
-            status,
-            transferred,
-            data,
-        });
-        true
     }
 
     pub fn contains_addr(&self, addr: u32) -> bool {
@@ -1428,15 +1276,81 @@ impl Hle {
     }
 
     pub fn has_messages(&self) -> bool {
-        !self.input_messages.is_empty()
-            || self
-                .app_messages
-                .iter()
-                .any(|message| !self.paint_message_suppressed_this_frame(*message))
+        self.has_matching_message(MessageFilter::any())
     }
 
     pub fn has_input_messages(&self) -> bool {
         !self.input_messages.is_empty()
+    }
+
+    pub fn has_matching_message(&self, filter: MessageFilter) -> bool {
+        self.matching_queued_message(filter).is_some()
+    }
+
+    fn matching_queued_message(&self, filter: MessageFilter) -> Option<QueuedMessage> {
+        self.matching_message_index(&self.input_messages, filter)
+            .map(|index| QueuedMessage {
+                kind: MessageQueueKind::Input,
+                index,
+                message: self.input_messages[index],
+            })
+            .or_else(|| {
+                self.matching_message_index(&self.app_messages, filter)
+                    .map(|index| QueuedMessage {
+                        kind: MessageQueueKind::App,
+                        index,
+                        message: self.app_messages[index],
+                    })
+            })
+    }
+
+    fn matching_message_index(&self, messages: &[Message], filter: MessageFilter) -> Option<usize> {
+        messages
+            .iter()
+            .position(|message| self.message_matches_filter(*message, filter))
+    }
+
+    fn message_matches_filter(&self, message: Message, filter: MessageFilter) -> bool {
+        !self.paint_message_suppressed_this_frame(message)
+            && self.message_hwnd_matches(message.hwnd, filter.hwnd)
+            && message_id_matches(message.msg, filter.min, filter.max)
+    }
+
+    fn message_hwnd_matches(&self, mut message_hwnd: u32, hwnd_filter: u32) -> bool {
+        if hwnd_filter == 0 {
+            return true;
+        }
+        if hwnd_filter == 0xffff_ffff {
+            return message_hwnd == 0;
+        }
+        loop {
+            if message_hwnd == hwnd_filter {
+                return true;
+            }
+            let Some(parent) = self.window(message_hwnd).map(|window| window.parent) else {
+                return false;
+            };
+            if parent == 0 {
+                return false;
+            }
+            message_hwnd = parent;
+        }
+    }
+
+    fn remove_queued_message(&mut self, queued: QueuedMessage, source: &'static str) -> bool {
+        if !message_remove_on_pm_remove(queued.message) {
+            return false;
+        }
+        match queued.kind {
+            MessageQueueKind::Input => {
+                self.input_messages.remove(queued.index);
+            }
+            MessageQueueKind::App => {
+                self.app_messages.remove(queued.index);
+            }
+        }
+        self.note_removed_message(source, queued.message);
+        true
     }
 
     pub fn has_active_popup_menu(&self) -> bool {
@@ -2166,9 +2080,10 @@ impl Hle {
         &mut self,
         hwnd: u32,
         requested_id: u32,
-        elapse_ms: u32,
         proc: u32,
         now_ms: u64,
+        scheduler_frame: u64,
+        target: HleDelayTarget,
     ) -> u32 {
         let id = if requested_id == 0 {
             let id = self.next_timer_id.max(1);
@@ -2177,7 +2092,8 @@ impl Hle {
         } else {
             requested_id
         };
-        let period_ms = elapse_ms.max(1) as u64;
+        let period_ms = target.delay_ms;
+        let period_frames = target.frame_count;
         if let Some(timer) = self
             .timers
             .iter_mut()
@@ -2185,14 +2101,18 @@ impl Hle {
         {
             timer.proc = proc;
             timer.period_ms = period_ms;
-            timer.next_ms = now_ms.saturating_add(period_ms);
+            timer.period_frames = period_frames;
+            timer.next_ms = target.until_ms(now_ms);
+            timer.eligible_frame = target.eligible_frame(scheduler_frame);
         } else {
             self.timers.push(Timer {
                 hwnd,
                 id,
                 proc,
                 period_ms,
-                next_ms: now_ms.saturating_add(period_ms),
+                period_frames,
+                next_ms: target.until_ms(now_ms),
+                eligible_frame: target.eligible_frame(scheduler_frame),
                 due_count: 0,
                 post_count: 0,
             });
@@ -2211,25 +2131,29 @@ impl Hle {
 
     pub fn set_mm_timer(
         &mut self,
-        delay_ms: u32,
         callback: u32,
         user: u32,
         event: u32,
         now_ms: u64,
+        scheduler_frame: u64,
+        target: HleDelayTarget,
     ) -> u32 {
         if callback == 0 {
             return 0;
         }
         let id = self.next_mm_timer_id.max(1);
         self.next_mm_timer_id = id.wrapping_add(1).max(1);
-        let period_ms = delay_ms.max(1) as u64;
+        let period_ms = target.delay_ms;
+        let period_frames = target.frame_count;
         self.mm_timers.push(MmTimer {
             id,
             callback,
             user,
             event,
             period_ms,
-            next_ms: now_ms.saturating_add(period_ms),
+            period_frames,
+            next_ms: target.until_ms(now_ms),
+            eligible_frame: target.eligible_frame(scheduler_frame),
             due_count: 0,
             call_count: 0,
         });
@@ -2242,14 +2166,7 @@ impl Hle {
         self.mm_timers.len() != old_len
     }
 
-    fn next_mm_timer_ms(&self) -> Option<u64> {
-        if self.mm_timer_callback_active {
-            return None;
-        }
-        self.mm_timers.iter().map(|timer| timer.next_ms).min()
-    }
-
-    fn take_due_mm_timer(&mut self, now_ms: u64) -> Option<MmTimerDue> {
+    fn take_due_mm_timer(&mut self, now_ms: u64, scheduler_frame: u64) -> Option<MmTimerDue> {
         const TIME_PERIODIC: u32 = 0x0001;
         if self.mm_timer_callback_active {
             return None;
@@ -2257,12 +2174,14 @@ impl Hle {
         let index = self
             .mm_timers
             .iter()
-            .position(|timer| now_ms >= timer.next_ms)?;
+            .position(|timer| now_ms >= timer.next_ms && scheduler_frame >= timer.eligible_frame)?;
         let timer = self.mm_timers[index];
         self.mm_timers[index].due_count = self.mm_timers[index].due_count.saturating_add(1);
         self.mm_timers[index].call_count = self.mm_timers[index].call_count.saturating_add(1);
         if (timer.event & TIME_PERIODIC) != 0 {
             self.mm_timers[index].next_ms = now_ms.saturating_add(timer.period_ms);
+            self.mm_timers[index].eligible_frame =
+                next_period_frame(scheduler_frame, timer.period_frames);
         } else {
             self.mm_timers.remove(index);
         }
@@ -2272,11 +2191,6 @@ impl Hle {
             callback: timer.callback,
             user: timer.user,
         })
-    }
-
-    fn next_due_mm_timer_ms(&self, until_ms: u64) -> Option<u64> {
-        self.next_mm_timer_ms()
-            .filter(|timer_ms| *timer_ms <= until_ms)
     }
 
     fn async_return_thunk(&self) -> u32 {
@@ -2387,11 +2301,11 @@ impl Hle {
         self.hooks.len() != old_len
     }
 
-    pub fn pump_timers(&mut self, now_ms: u64) {
+    pub fn pump_timers(&mut self, now_ms: u64, scheduler_frame: u64) {
         const WM_TIMER: u32 = 0x0113;
         for index in 0..self.timers.len() {
             let timer = self.timers[index];
-            if now_ms < timer.next_ms {
+            if now_ms < timer.next_ms || scheduler_frame < timer.eligible_frame {
                 continue;
             }
             self.timers[index].due_count = self.timers[index].due_count.saturating_add(1);
@@ -2410,6 +2324,8 @@ impl Hle {
                 self.timers[index].post_count = self.timers[index].post_count.saturating_add(1);
             }
             self.timers[index].next_ms = now_ms.saturating_add(timer.period_ms);
+            self.timers[index].eligible_frame =
+                next_period_frame(scheduler_frame, timer.period_frames);
         }
     }
 
@@ -2533,6 +2449,7 @@ impl Hle {
         if let Some(bytes) = self.virtual_file_bytes(&key) {
             let image = crate::pe::load_pe32_dll_bytes(PathBuf::from(&key), &bytes, mem, self)?;
             let handle = image.image_base;
+            trace_fs!("Load mounted virtual PE module {key} -> {handle:08x}");
             self.module_images.insert(handle, image);
             self.modules.insert(key.clone(), handle);
             if let Some(file_name) = key.rsplit('\\').next() {
@@ -2564,7 +2481,7 @@ impl Hle {
 
     fn virtual_file_bytes(&self, raw: &str) -> Option<Vec<u8>> {
         let key = self.guest_path_key(raw);
-        self.virtual_files
+        self.vfs.files
             .get(&key)
             .map(|data| data.borrow().clone())
     }
@@ -3282,337 +3199,6 @@ impl Hle {
             return slot.take().is_some();
         }
         false
-    }
-
-    fn open_virtual_file(&mut self, raw: &str, access: u32, creation: u32) -> VirtualOpen {
-        let key = self.guest_path_key(raw);
-        let wants_write = (access & 0x4000_0000) != 0;
-        let async_existing = self.async_vfs_entries.get(&key).copied();
-        let existing = self.virtual_files.get(&key).cloned();
-        if existing.is_none() {
-            if let Some(open) = self.open_async_virtual_file(&key, async_existing, wants_write, creation) {
-                return open;
-            }
-        }
-        let data = match (creation, existing) {
-            (1, Some(_)) => return VirtualOpen::Failed(80),
-            (1, None) if self.virtual_fs_enabled && wants_write => {
-                let data = Rc::new(RefCell::new(Vec::new()));
-                self.virtual_files.insert(key.clone(), data.clone());
-                data
-            }
-            (2, Some(data)) | (5, Some(data)) => {
-                if wants_write {
-                    data.borrow_mut().clear();
-                }
-                data
-            }
-            (2, None) | (4, None) if self.virtual_fs_enabled && wants_write => {
-                let data = Rc::new(RefCell::new(Vec::new()));
-                self.virtual_files.insert(key.clone(), data.clone());
-                data
-            }
-            (3, Some(data)) | (4, Some(data)) => data,
-            (_, Some(data)) => data,
-            _ if self.virtual_fs_enabled => return VirtualOpen::Failed(2),
-            _ => return VirtualOpen::Miss,
-        };
-        let handle = self.alloc_handle(Handle::File(FileHandle::memory(key, data, wants_write)));
-        VirtualOpen::Opened(handle)
-    }
-
-    fn open_async_virtual_file(
-        &mut self,
-        key: &str,
-        existing: Option<AsyncVfsEntry>,
-        wants_write: bool,
-        creation: u32,
-    ) -> Option<VirtualOpen> {
-        let can_create_for_write = self.async_vfs_writable && wants_write;
-        let mut entry = match (creation, existing) {
-            (1, Some(_)) => return Some(VirtualOpen::Failed(80)),
-            (1, None) if can_create_for_write => AsyncVfsEntry {
-                size: 0,
-                writable: true,
-            },
-            (2, Some(mut entry)) | (5, Some(mut entry)) if can_create_for_write => {
-                entry.size = 0;
-                entry.writable = true;
-                entry
-            }
-            (2, None) | (4, None) if can_create_for_write => AsyncVfsEntry {
-                size: 0,
-                writable: true,
-            },
-            (3, Some(entry)) | (4, Some(entry)) => {
-                if wants_write && !entry.writable && !self.async_vfs_writable {
-                    return Some(VirtualOpen::Failed(5));
-                }
-                AsyncVfsEntry {
-                    writable: entry.writable || (wants_write && self.async_vfs_writable),
-                    ..entry
-                }
-            }
-            (_, Some(entry)) => entry,
-            _ if self.virtual_fs_enabled => return Some(VirtualOpen::Failed(2)),
-            _ => return None,
-        };
-        if wants_write && self.async_vfs_writable {
-            entry.writable = true;
-        }
-        self.async_vfs_entries.insert(key.to_string(), entry);
-        let handle = self.alloc_handle(Handle::File(FileHandle::async_file(
-            key.to_string(),
-            entry.size,
-            wants_write && entry.writable,
-        )));
-        Some(VirtualOpen::Opened(handle))
-    }
-
-    fn begin_vfs_read(&mut self, key: &str, offset: u64, len: u32) -> u32 {
-        assert!(
-            self.pending_vfs_request.is_none(),
-            "new async VFS read while another request is pending"
-        );
-        let id = self.alloc_vfs_request_id();
-        self.pending_vfs_request = Some(PendingVfsRequest {
-            id,
-            kind: PendingVfsRequestKind::Read,
-            path: key.to_string(),
-            offset,
-            len,
-            data: Vec::new(),
-        });
-        id
-    }
-
-    fn begin_vfs_write(&mut self, key: &str, offset: u64, data: Vec<u8>) -> u32 {
-        assert!(
-            self.pending_vfs_request.is_none(),
-            "new async VFS write while another request is pending"
-        );
-        let id = self.alloc_vfs_request_id();
-        self.pending_vfs_request = Some(PendingVfsRequest {
-            id,
-            kind: PendingVfsRequestKind::Write,
-            path: key.to_string(),
-            offset,
-            len: data.len() as u32,
-            data,
-        });
-        id
-    }
-
-    pub(crate) fn has_completed_vfs_request(&self, request_id: u32) -> bool {
-        self.completed_vfs_requests
-            .iter()
-            .any(|req| req.id == request_id)
-    }
-
-    pub(crate) fn take_completed_vfs_request(
-        &mut self,
-        request_id: u32,
-    ) -> Option<CompletedVfsRequest> {
-        let index = self
-            .completed_vfs_requests
-            .iter()
-            .position(|req| req.id == request_id)?;
-        Some(self.completed_vfs_requests.remove(index))
-    }
-
-    fn alloc_vfs_request_id(&mut self) -> u32 {
-        let id = self.next_vfs_request_id.max(1);
-        self.next_vfs_request_id = self.next_vfs_request_id.wrapping_add(1).max(1);
-        id
-    }
-
-    fn delete_virtual_file(&mut self, raw: &str) -> Option<bool> {
-        let key = self.guest_path_key(raw);
-        if self.virtual_files.remove(&key).is_some() {
-            Some(true)
-        } else if self.async_vfs_entries.remove(&key).is_some() {
-            Some(true)
-        } else if self.virtual_fs_enabled {
-            Some(false)
-        } else {
-            None
-        }
-    }
-
-    fn move_virtual_file(&mut self, from: &str, to: &str) -> Option<bool> {
-        let from_key = self.guest_path_key(from);
-        let to_key = self.guest_path_key(to);
-        if let Some(data) = self.virtual_files.remove(&from_key) {
-            self.virtual_files.insert(to_key, data);
-            Some(true)
-        } else if let Some(entry) = self.async_vfs_entries.remove(&from_key) {
-            self.async_vfs_entries.insert(to_key, entry);
-            Some(true)
-        } else if self.virtual_fs_enabled {
-            Some(false)
-        } else {
-            None
-        }
-    }
-
-    fn virtual_file_attributes(&self, raw: &str) -> Option<u32> {
-        let key = self.guest_path_key(raw);
-        if self.virtual_files.contains_key(&key) {
-            return Some(0x80);
-        }
-        if self.async_vfs_entries.contains_key(&key) {
-            return Some(0x80);
-        }
-        let directory_prefix = if key.ends_with('\\') {
-            key
-        } else {
-            format!("{key}\\")
-        };
-        if self
-            .virtual_files
-            .keys()
-            .any(|file| file.starts_with(&directory_prefix))
-            || self
-                .async_vfs_entries
-                .keys()
-                .any(|file| file.starts_with(&directory_prefix))
-        {
-            return Some(0x10);
-        }
-        if self.virtual_fs_enabled {
-            Some(INVALID_HANDLE_VALUE)
-        } else {
-            None
-        }
-    }
-
-    fn guest_path_key(&self, raw: &str) -> String {
-        self.apply_virtual_drive_alias(self.guest_path_key_no_alias(raw))
-    }
-
-    fn guest_path_key_no_alias(&self, raw: &str) -> String {
-        let path = raw.replace('/', "\\");
-        let mut drive = self.cwd_drive.to_ascii_uppercase();
-        let mut rest = path.as_str();
-        let absolute_drive = path.len() >= 2 && path.as_bytes()[1] == b':';
-        if absolute_drive {
-            drive = path.as_bytes()[0].to_ascii_uppercase() as char;
-            rest = &path[2..];
-        }
-
-        let mut parts = Vec::new();
-        if !rest.starts_with('\\') && !absolute_drive {
-            for part in self
-                .cwd_path
-                .trim_start_matches('\\')
-                .split('\\')
-                .filter(|part| !part.is_empty())
-            {
-                parts.push(part.to_string());
-            }
-        }
-        for part in rest
-            .trim_start_matches('\\')
-            .split('\\')
-            .filter(|part| !part.is_empty() && *part != ".")
-        {
-            if part == ".." {
-                parts.pop();
-            } else {
-                parts.push(part.to_string());
-            }
-        }
-
-        if parts.is_empty() {
-            format!("{drive}:\\").to_ascii_lowercase()
-        } else {
-            format!("{drive}:\\{}", parts.join("\\")).to_ascii_lowercase()
-        }
-    }
-
-    fn apply_virtual_drive_alias(&self, key: String) -> String {
-        if key.len() < 3 || key.as_bytes()[1] != b':' {
-            return key;
-        }
-        let Some(idx) = drive_index(key.as_bytes()[0] as char) else {
-            return key;
-        };
-        let Some(alias) = self.virtual_drive_aliases[idx].as_ref() else {
-            return key;
-        };
-        if key.len() == 3 {
-            return alias.clone();
-        }
-        join_guest_key(alias, key[3..].trim_start_matches('\\'))
-    }
-
-    fn mark_virtual_drive_present_for_key(&mut self, key: &str) {
-        if key.len() >= 2 && key.as_bytes()[1] == b':' {
-            if let Some(idx) = drive_index(key.as_bytes()[0] as char) {
-                self.virtual_drive_present[idx] = true;
-            }
-        }
-    }
-
-    fn virtual_directory_exists_key(&self, key: &str) -> bool {
-        let prefix = if key.ends_with('\\') {
-            key.to_string()
-        } else {
-            format!("{key}\\")
-        };
-        self.virtual_files
-            .keys()
-            .any(|file| file.starts_with(&prefix))
-            || self
-                .async_vfs_entries
-                .keys()
-                .any(|file| file.starts_with(&prefix))
-    }
-
-    fn translate_raw_path(&self, raw: &str) -> Result<PathBuf> {
-        let path = raw.replace('/', "\\");
-        let (drive, rest) = if path.len() >= 2 && path.as_bytes()[1] == b':' {
-            (path.as_bytes()[0].to_ascii_uppercase() as char, &path[2..])
-        } else {
-            (self.cwd_drive, path.as_str())
-        };
-        let idx = drive as usize - 'A' as usize;
-        let root = self.drives[idx]
-            .as_ref()
-            .ok_or_else(|| Error::Hle(format!("drive {drive}: is not mounted for {raw}")))?;
-
-        let mut out = root.clone();
-        let rel = if rest.starts_with('\\') || rest.starts_with('/') {
-            &rest[1..]
-        } else if path.len() >= 2 && path.as_bytes()[1] == b':' {
-            rest
-        } else {
-            self.cwd_path.trim_start_matches('\\')
-        };
-        if !rel.is_empty() {
-            for part in rel.split('\\').filter(|p| !p.is_empty() && *p != ".") {
-                if part == ".." {
-                    out.pop();
-                } else {
-                    out.push(part);
-                }
-            }
-        }
-        if path.len() < 2 || path.as_bytes()[1] != b':' {
-            for part in path.split('\\').filter(|p| !p.is_empty() && *p != ".") {
-                if part == ".." {
-                    out.pop();
-                } else {
-                    out.push(part);
-                }
-            }
-        }
-        Ok(out)
-    }
-
-    fn translate_path(&self, mem: &Memory, addr: u32) -> Result<PathBuf> {
-        let raw = mem.cstr_lossy(addr, 1024)?;
-        self.translate_raw_path(&raw)
     }
 
     fn ensure_ddraw_tables(&mut self, mem: &mut Memory) -> Result<()> {
@@ -5130,9 +4716,10 @@ fn hle_ok_this(emu: &mut Emulator, _: &HleEntry) -> HleResult {
 #[cfg(test)]
 mod hle_base_tests {
     use super::{
-        mouse_lparam, Handle, Hle, HleControlKind, HleEntry, HleMenu, HleMenuItem, HlePopupMenu,
-        HlePopupMenuItem, HleResult, HleWindow, FileBackend, VirtualOpen, WindowRect, DIALOG_BORDER,
-        DIALOG_TITLE_HEIGHT, MENU_BAR_HEIGHT, WS_CAPTION,
+        mouse_lparam, FileBackend, FileReadResult, FileWriteResult, Handle, Hle, HleControlKind,
+        HleDelayTarget, HleEntry, HleMenu, HleMenuItem, HlePopupMenu, HlePopupMenuItem, HleResult,
+        HleWindow, VirtualOpen, WindowRect, DIALOG_BORDER, DIALOG_TITLE_HEIGHT, MENU_BAR_HEIGHT,
+        WS_CAPTION,
     };
     use crate::Emulator;
     use crate::memory::{Memory, PagePerm};
@@ -5277,6 +4864,28 @@ mod hle_base_tests {
     }
 
     #[test]
+    fn virtual_drive_aliases_map_files_and_drive_type() {
+        let mut hle = Hle::new();
+        hle.add_virtual_file("C:\\Game\\Data\\File.TXT", b"alias");
+        hle.set_virtual_drive_alias('D', "C:\\Game\\Data", "cdrom");
+
+        assert!(hle.drive_is_mounted('D'));
+        assert_eq!(hle.drive_type('D'), Some(5));
+
+        let h = match hle.open_virtual_file("D:\\file.txt", 0x8000_0000, 3) {
+            VirtualOpen::Opened(h) => h,
+            _ => panic!("aliased virtual file did not open"),
+        };
+        match hle.handle_mut(h) {
+            Some(Handle::File(file)) => match &file.backend {
+                FileBackend::Memory(data) => assert_eq!(&*data.borrow(), b"alias"),
+                _ => panic!("unexpected file backend"),
+            },
+            _ => panic!("unexpected handle type"),
+        }
+    }
+
+    #[test]
     fn enabled_virtual_fs_reports_missing_files() {
         let mut hle = Hle::new();
         hle.enable_virtual_fs();
@@ -5285,6 +4894,96 @@ mod hle_base_tests {
             VirtualOpen::Failed(2) => {}
             _ => panic!("missing virtual file did not report ERROR_FILE_NOT_FOUND"),
         }
+    }
+
+    #[test]
+    fn vfs_cwd_resolves_display_paths_and_keys() {
+        let mut hle = Hle::new();
+        hle.set_cwd('d', "\\Games\\Rich4".to_string());
+
+        assert_eq!(hle.cwd_display(), "D:\\Games\\Rich4");
+        assert_eq!(
+            hle.full_guest_path("data\\map.dat"),
+            "D:\\Games\\Rich4\\data\\map.dat"
+        );
+        assert_eq!(
+            hle.vfs_key_for_guest("..\\save\\GAME.DAT"),
+            "d:\\games\\save\\game.dat"
+        );
+    }
+
+    #[test]
+    fn virtual_find_entries_lists_immediate_files_and_directories() {
+        let mut hle = Hle::new();
+        hle.add_virtual_file("C:\\Data\\Readme.TXT", b"abc");
+        hle.add_virtual_file("C:\\Data\\Sub\\Nested.DAT", b"nested");
+        hle.add_async_virtual_file("C:\\Data\\Async.BIN", 7, false);
+
+        let mut entries = hle.virtual_find_entries("c:\\data").unwrap();
+        entries.sort_by_key(|entry| entry.name.clone());
+
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].name, "async.bin");
+        assert_eq!(entries[0].attrs, 0x80);
+        assert_eq!(entries[0].size, 7);
+        assert_eq!(entries[1].name, "readme.txt");
+        assert_eq!(entries[1].attrs, 0x80);
+        assert_eq!(entries[1].size, 3);
+        assert_eq!(entries[2].name, "sub");
+        assert_eq!(entries[2].attrs, 0x10);
+    }
+
+    #[test]
+    fn async_vfs_requests_are_tracked_by_vfs_state() {
+        let mut hle = Hle::new();
+        hle.add_async_virtual_file("C:\\Data\\Async.BIN", 4, true);
+
+        let h = match hle.open_virtual_file("C:\\Data\\Async.BIN", 0xc000_0000, 3) {
+            VirtualOpen::Opened(h) => h,
+            _ => panic!("async virtual file did not open"),
+        };
+
+        let mut buf = [0; 2];
+        let (key, offset, len) = match hle.handle_mut(h) {
+            Some(Handle::File(file)) => match file.read(&mut buf) {
+                FileReadResult::Pending { key, offset, len } => (key, offset, len),
+                _ => panic!("async read did not produce a pending request"),
+            },
+            _ => panic!("unexpected handle type"),
+        };
+        let read_id = hle.begin_vfs_read(&key, offset, len);
+        assert_eq!(hle.pending_vfs_request_id(), read_id);
+        assert_eq!(hle.pending_vfs_request_kind(), 1);
+        assert_eq!(hle.pending_vfs_request_path(), b"c:\\data\\async.bin");
+        assert_eq!(hle.pending_vfs_request_offset(), 0);
+        assert_eq!(hle.pending_vfs_request_len(), 2);
+
+        assert!(hle.complete_vfs_request(read_id, 0, 2, vec![1, 2]));
+        let completed = hle.take_completed_vfs_request(read_id).unwrap();
+        assert_eq!(completed.data, vec![1, 2]);
+
+        let (key, offset, data) = match hle.handle_mut(h) {
+            Some(Handle::File(file)) => match file.write(vec![3, 4, 5]) {
+                FileWriteResult::Pending { key, offset, data } => (key, offset, data),
+                _ => panic!("async write did not produce a pending request"),
+            },
+            _ => panic!("unexpected handle type"),
+        };
+        hle.note_async_vfs_write(&key, offset, data.len());
+        let write_id = hle.begin_vfs_write(&key, offset, data);
+        assert_eq!(hle.pending_vfs_request_kind(), 2);
+        assert_eq!(hle.pending_vfs_request_offset(), 2);
+        assert_eq!(hle.pending_vfs_request_len(), 3);
+        assert_eq!(hle.pending_vfs_request_data(), &[3, 4, 5]);
+
+        assert!(hle.complete_vfs_request(write_id, 0, 3, Vec::new()));
+        assert!(hle.has_completed_vfs_request(write_id));
+        let entries = hle.virtual_find_entries("C:\\Data").unwrap();
+        let entry = entries
+            .iter()
+            .find(|entry| entry.name == "async.bin")
+            .unwrap();
+        assert_eq!(entry.size, 5);
     }
 
     #[test]
@@ -5798,18 +5497,19 @@ mod hle_base_tests {
     fn timers_use_millisecond_clock() {
         let mut hle = Hle::new();
 
-        hle.set_timer(0x20001, 7, 10, 0, 100);
-        hle.pump_timers(109);
+        let target = hle.delay_target(10, 0);
+        hle.set_timer(0x20001, 7, 0, 100, 0, target);
+        hle.pump_timers(109, 0);
         assert!(hle.app_messages.is_empty());
 
-        hle.pump_timers(110);
+        hle.pump_timers(110, 0);
         assert_eq!(hle.app_messages.len(), 1);
         assert_eq!(hle.app_messages[0].msg, 0x0113);
         assert_eq!(hle.app_messages[0].wparam, 7);
         assert_eq!(hle.timers[0].due_count, 1);
         assert_eq!(hle.timers[0].post_count, 1);
 
-        hle.pump_timers(120);
+        hle.pump_timers(120, 0);
         assert_eq!(hle.app_messages.len(), 1);
         assert_eq!(hle.timers[0].due_count, 2);
         assert_eq!(hle.timers[0].post_count, 1);
@@ -5817,22 +5517,91 @@ mod hle_base_tests {
     }
 
     #[test]
+    fn live_delay_target_rounds_guest_ms_to_frontend_frames() {
+        let mut hle = Hle::new();
+        hle.set_frontend_timing(100, 10_000);
+
+        assert_eq!(
+            hle.delay_target(0, 7),
+            HleDelayTarget {
+                delay_ms: 0,
+                frame_count: 1,
+            }
+        );
+        assert_eq!(
+            hle.delay_target(14, 7),
+            HleDelayTarget {
+                delay_ms: 10,
+                frame_count: 1,
+            }
+        );
+        assert_eq!(
+            hle.delay_target(15, 7),
+            HleDelayTarget {
+                delay_ms: 20,
+                frame_count: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn user_timers_are_not_posted_before_eligible_frame() {
+        let mut hle = Hle::new();
+        hle.set_frontend_timing(100, 10_000);
+
+        let target = hle.delay_target(1, 1);
+        hle.set_timer(0x20001, 7, 0, 100, 1, target);
+        assert_eq!(hle.timers[0].next_ms, 110);
+        hle.pump_timers(109, 2);
+        assert!(hle.app_messages.is_empty());
+        assert_eq!(hle.timers[0].due_count, 0);
+
+        hle.pump_timers(110, 1);
+        assert!(hle.app_messages.is_empty());
+        assert_eq!(hle.timers[0].due_count, 0);
+
+        hle.pump_timers(110, 2);
+        assert_eq!(hle.app_messages.len(), 1);
+        assert_eq!(hle.app_messages[0].msg, 0x0113);
+        assert_eq!(hle.timers[0].due_count, 1);
+        assert_eq!(hle.timers[0].eligible_frame, 3);
+        assert_eq!(hle.timers[0].next_ms, 120);
+    }
+
+    #[test]
     fn multimedia_timers_schedule_periodic_callbacks() {
         let mut hle = Hle::new();
 
-        let id = hle.set_mm_timer(20, 0x401f2d, 0xfeed, 1, 100);
+        let target = hle.delay_target(20, 0);
+        let id = hle.set_mm_timer(0x401f2d, 0xfeed, 1, 100, 0, target);
 
         assert_eq!(id, 1);
-        assert!(hle.take_due_mm_timer(119).is_none());
-        let due = hle.take_due_mm_timer(120).unwrap();
+        assert!(hle.take_due_mm_timer(119, 0).is_none());
+        let due = hle.take_due_mm_timer(120, 0).unwrap();
         assert_eq!(due.id, id);
         assert_eq!(due.callback, 0x401f2d);
         assert_eq!(due.user, 0xfeed);
-        assert!(hle.take_due_mm_timer(140).is_none());
+        assert!(hle.take_due_mm_timer(140, 0).is_none());
         assert_eq!(hle.finish_async_callback(), 0);
-        assert!(hle.take_due_mm_timer(139).is_none());
-        assert!(hle.take_due_mm_timer(140).is_some());
+        assert!(hle.take_due_mm_timer(139, 0).is_none());
+        assert!(hle.take_due_mm_timer(140, 0).is_some());
         assert!(hle.state_summary(140).contains("cb=00401f2d"));
+    }
+
+    #[test]
+    fn multimedia_timers_are_not_taken_before_eligible_frame() {
+        let mut hle = Hle::new();
+        hle.set_frontend_timing(100, 10_000);
+
+        let target = hle.delay_target(1, 1);
+        let id = hle.set_mm_timer(0x401f2d, 0xfeed, 1, 100, 1, target);
+
+        assert_eq!(id, 1);
+        assert!(hle.take_due_mm_timer(109, 2).is_none());
+        assert!(hle.take_due_mm_timer(110, 1).is_none());
+        let due = hle.take_due_mm_timer(110, 2).unwrap();
+        assert_eq!(due.callback, 0x401f2d);
+        assert_eq!(hle.mm_timers[0].eligible_frame, 3);
     }
 
     #[test]

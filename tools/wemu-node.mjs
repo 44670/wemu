@@ -14,7 +14,8 @@ function usage() {
       "usage: node tools/wemu-node.mjs --exe HOST_EXE [--guest-exe C:\\\\game.exe]",
       "       [--wasm target/wasm32-unknown-unknown/release/wemu.wasm]",
       "       [--mount C=/host/dir] [--file C:\\\\path=host/file]",
-      "       [--async-vfs] [--max-insns N] [--screenshot out.png]",
+      "       [--async-vfs] [--max-insns N] [--frontend-fps N] [--screenshot out.png]",
+      "       [--trace fs,gdi,ddraw,alloc]",
     ].join("\n"),
   );
 }
@@ -32,6 +33,8 @@ function parseArgs(argv) {
     screenshot: "/tmp/wemu-wasm.png",
     width: 640,
     height: 480,
+    frontendFps: 60,
+    traceFlags: 0,
   };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -80,6 +83,12 @@ function parseArgs(argv) {
       case "--height":
         cfg.height = parseCount(next(), arg);
         break;
+      case "--frontend-fps":
+        cfg.frontendFps = parseCount(next(), arg);
+        break;
+      case "--trace":
+        cfg.traceFlags = parseTraceFlags(next());
+        break;
       default:
         throw new Error(`unknown argument ${arg}`);
     }
@@ -91,6 +100,31 @@ function parseArgs(argv) {
     throw new Error("--chunk-insns must be greater than zero");
   }
   return cfg;
+}
+
+function parseTraceFlags(value) {
+  let flags = 0;
+  for (const part of value.split(",")) {
+    switch (part.trim().toLowerCase()) {
+      case "":
+        break;
+      case "fs":
+        flags |= 1 << 0;
+        break;
+      case "alloc":
+        flags |= 1 << 1;
+        break;
+      case "ddraw":
+        flags |= 1 << 2;
+        break;
+      case "gdi":
+        flags |= 1 << 3;
+        break;
+      default:
+        throw new Error(`unknown trace flag ${part}`);
+    }
+  }
+  return flags >>> 0;
 }
 
 function parseCount(value, name) {
@@ -128,10 +162,6 @@ function guestPathForMount(mount, hostPath) {
   }
   const guestRel = rel.split(path.sep).filter(Boolean).join("\\");
   return `${mount.drive}:\\${guestRel}`;
-}
-
-function vfsKey(guest) {
-  return String(guest).replaceAll("/", "\\").toLowerCase();
 }
 
 function syncPeImportPath(guest) {
@@ -210,15 +240,29 @@ async function main() {
   if (!handle) {
     throw new Error("wemu_new failed");
   }
+  if (cfg.traceFlags) {
+    e.wemu_set_hle_trace_flags(cfg.traceFlags);
+  }
 
   const readUtf8 = (ptr, len) => decoder.decode(new Uint8Array(e.memory.buffer, ptr, len));
   const lastError = () => readUtf8(e.wemu_last_error_ptr(handle), e.wemu_last_error_len(handle));
+  const lastHle = () => readUtf8(e.wemu_last_hle_ptr(handle), e.wemu_last_hle_len(handle));
   const check = (rc, label) => {
     if (rc < 0) {
       throw new Error(`${label}: ${lastError()}`);
     }
     return rc;
   };
+  if (cfg.frontendFps) {
+    check(
+      e.wemu_set_frontend_timing(
+        handle,
+        cfg.frontendFps,
+        Math.round(1_000_000 / cfg.frontendFps),
+      ),
+      "set frontend timing",
+    );
+  }
   const withBytes = (bytes, fn) => {
     const ptr = e.wemu_alloc(bytes.length);
     if (!ptr && bytes.length) {
@@ -232,6 +276,11 @@ async function main() {
     }
   };
   const withString = (text, fn) => withBytes(encoder.encode(text), fn);
+  const lastBlob = () => readUtf8(e.wemu_blob_ptr(handle), e.wemu_blob_len(handle));
+  const guestPathKey = (guest) => withString(guest, (pathPtr, pathLen) => {
+    check(e.wemu_guest_path_key(handle, pathPtr, pathLen), `key ${guest}`);
+    return lastBlob();
+  });
   const addFile = (guest, host) => {
     const data = fs.readFileSync(host);
     withString(guest, (pathPtr, pathLen) => {
@@ -252,7 +301,7 @@ async function main() {
         `add async ${guest}`,
       );
     });
-    vfsFiles.set(vfsKey(guest), host);
+    vfsFiles.set(guestPathKey(guest), host);
   };
   const completeVfs = (id, status, transferred, data = new Uint8Array(0)) => {
     withBytes(data, (ptr, len) => {
@@ -272,7 +321,7 @@ async function main() {
       e.wemu_pending_vfs_request_path_ptr(handle),
       e.wemu_pending_vfs_request_path_len(handle),
     );
-    const key = vfsKey(guest);
+    const key = guest;
     const offset =
       e.wemu_pending_vfs_request_offset_lo(handle) +
       e.wemu_pending_vfs_request_offset_hi(handle) * 0x100000000;
@@ -376,7 +425,12 @@ async function main() {
     `wemu wasm stopped=${stopName(stop)} exit_code=${exitCode} insns=${insns} eip=${e
       .wemu_eip(handle)
       .toString(16)
-      .padStart(8, "0")} mounted_files=${mounted} screenshot=${cfg.screenshot}`,
+      .padStart(8, "0")} eax=${e.wemu_reg(handle, 0).toString(16).padStart(8, "0")} esp=${e
+      .wemu_reg(handle, 4)
+      .toString(16)
+      .padStart(8, "0")} last_hle=${lastHle() || "-"} mounted_files=${mounted} screenshot=${
+      cfg.screenshot
+    }`,
   );
   e.wemu_destroy(handle);
 }

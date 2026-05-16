@@ -34,110 +34,6 @@ fn win_protect_to_perm(protect: u32) -> PagePerm {
     }
 }
 
-
-
-
-fn push_unique_path(out: &mut Vec<PathBuf>, path: PathBuf) {
-    if !out.iter().any(|old| old == &path) {
-        out.push(path);
-    }
-}
-
-fn flattened_data_path(raw_name: &str, path: &Path) -> Option<PathBuf> {
-    let raw = raw_name.replace('/', "\\");
-    let rest = if raw.len() >= 2 && raw.as_bytes()[1] == b':' {
-        &raw[2..]
-    } else {
-        raw.as_str()
-    };
-    let parts: Vec<&str> = rest
-        .trim_start_matches('\\')
-        .split('\\')
-        .filter(|part| !part.is_empty() && *part != ".")
-        .collect();
-    if parts.len() < 2 || !parts[0].eq_ignore_ascii_case("data") {
-        return None;
-    }
-    let mut base = path.to_path_buf();
-    for _ in 0..parts.len() {
-        base.pop();
-    }
-    for part in &parts[1..] {
-        base.push(part);
-    }
-    Some(base)
-}
-
-fn flattened_legacy_root_path(raw_name: &str, path: &Path) -> Option<PathBuf> {
-    let raw = raw_name.replace('/', "\\");
-    let rest = if raw.len() >= 2 && raw.as_bytes()[1] == b':' {
-        &raw[2..]
-    } else {
-        raw.as_str()
-    };
-    let parts: Vec<&str> = rest
-        .trim_start_matches('\\')
-        .split('\\')
-        .filter(|part| !part.is_empty() && *part != ".")
-        .collect();
-    if parts.len() < 2 {
-        return None;
-    }
-    let mut base = path.to_path_buf();
-    for _ in 0..parts.len() {
-        base.pop();
-    }
-    base.push(parts.last()?);
-    Some(base)
-}
-
-fn case_insensitive_existing_path(path: &Path) -> Option<PathBuf> {
-    use std::path::Component;
-
-    let mut current = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Prefix(_) | Component::RootDir | Component::CurDir | Component::ParentDir => {
-                current.push(component.as_os_str());
-            }
-            Component::Normal(part) => {
-                let dir = if current.as_os_str().is_empty() {
-                    Path::new(".")
-                } else {
-                    current.as_path()
-                };
-                let wanted = part.to_string_lossy();
-                let found = fs::read_dir(dir).ok()?.find_map(|entry| {
-                    let entry = entry.ok()?;
-                    let name = entry.file_name();
-                    name.to_string_lossy()
-                        .eq_ignore_ascii_case(&wanted)
-                        .then_some(name)
-                })?;
-                current.push(found);
-            }
-        }
-    }
-    current.exists().then_some(current)
-}
-
-
-fn split_find_pattern(raw: &str) -> (String, String) {
-    let raw = raw.replace('/', "\\");
-    let (dir, pattern) = match raw.rfind('\\') {
-        Some(0) => ("\\".to_string(), raw[1..].to_string()),
-        Some(pos) => (raw[..pos].to_string(), raw[pos + 1..].to_string()),
-        None => (".".to_string(), raw),
-    };
-    let pattern = if pattern.is_empty() || pattern == "*.*" {
-        "*".to_string()
-    } else {
-        pattern
-    };
-    (dir, pattern)
-}
-
-
 fn write_find_data_a(emu: &mut Emulator, out: u32, entry: &FindEntry) {
     if out == 0 {
         return;
@@ -1226,6 +1122,167 @@ mod tests {
         });
     }
 
+    fn test_message(hwnd: u32, msg: u32, wparam: u32) -> Message {
+        Message {
+            hwnd,
+            msg,
+            wparam,
+            lparam: 0,
+        }
+    }
+
+    fn setup_peek_message_args(emu: &mut Emulator, remove: u32) {
+        write_arg(emu, 0, TEST_DATA);
+        write_arg(emu, 1, 0);
+        write_arg(emu, 2, 0);
+        write_arg(emu, 3, 0);
+        write_arg(emu, 4, remove);
+    }
+
+    #[test]
+    fn peek_message_no_remove_keeps_message() {
+        let mut emu = Emulator::new();
+        prepare_hle_stack(&mut emu);
+        setup_peek_message_args(&mut emu, 0);
+        emu.hle
+            .app_messages
+            .push(test_message(0x0002_0001, 0x0400, 0x55));
+
+        assert_eq!(
+            hle_peek_message_a(&mut emu, &dummy_entry(hle_peek_message_a)),
+            HleResult::Retn(20)
+        );
+
+        assert_eq!(emu.cpu.reg(Reg::Eax), 1);
+        assert_eq!(emu.memory.read_u32(TEST_DATA + 4).unwrap(), 0x0400);
+        assert_eq!(emu.hle.app_messages.len(), 1);
+    }
+
+    #[test]
+    fn peek_message_remove_dequeues_normal_message() {
+        let mut emu = Emulator::new();
+        prepare_hle_stack(&mut emu);
+        setup_peek_message_args(&mut emu, 1);
+        emu.hle
+            .app_messages
+            .push(test_message(0x0002_0001, 0x0400, 0x55));
+
+        assert_eq!(
+            hle_peek_message_a(&mut emu, &dummy_entry(hle_peek_message_a)),
+            HleResult::Retn(20)
+        );
+
+        assert_eq!(emu.cpu.reg(Reg::Eax), 1);
+        assert_eq!(emu.memory.read_u32(TEST_DATA).unwrap(), 0x0002_0001);
+        assert_eq!(emu.memory.read_u32(TEST_DATA + 4).unwrap(), 0x0400);
+        assert!(emu.hle.app_messages.is_empty());
+    }
+
+    #[test]
+    fn peek_message_prefers_input_queue() {
+        let mut emu = Emulator::new();
+        prepare_hle_stack(&mut emu);
+        setup_peek_message_args(&mut emu, 1);
+        emu.hle
+            .app_messages
+            .push(test_message(0x0002_0001, 0x0400, 0x11));
+        emu.hle
+            .input_messages
+            .push(test_message(0x0002_0001, 0x0100, 0x41));
+
+        assert_eq!(
+            hle_peek_message_a(&mut emu, &dummy_entry(hle_peek_message_a)),
+            HleResult::Retn(20)
+        );
+
+        assert_eq!(emu.memory.read_u32(TEST_DATA + 4).unwrap(), 0x0100);
+        assert!(emu.hle.input_messages.is_empty());
+        assert_eq!(emu.hle.app_messages.len(), 1);
+    }
+
+    #[test]
+    fn peek_message_pm_remove_keeps_paint_message_queued() {
+        let mut emu = Emulator::new();
+        prepare_hle_stack(&mut emu);
+        setup_peek_message_args(&mut emu, 1);
+        emu.hle
+            .app_messages
+            .push(test_message(0x0002_0001, 0x000f, 0));
+
+        assert_eq!(
+            hle_peek_message_a(&mut emu, &dummy_entry(hle_peek_message_a)),
+            HleResult::Retn(20)
+        );
+
+        assert_eq!(emu.cpu.reg(Reg::Eax), 1);
+        assert_eq!(emu.memory.read_u32(TEST_DATA + 4).unwrap(), 0x000f);
+        assert_eq!(emu.hle.app_messages.len(), 1);
+    }
+
+    #[test]
+    fn peek_message_does_not_pump_due_user_timer() {
+        let mut emu = Emulator::new();
+        prepare_hle_stack(&mut emu);
+        setup_peek_message_args(&mut emu, 0);
+        let target = emu.hle.delay_target(10, 0);
+        emu.hle.set_timer(0, 1, 0, 0, 0, target);
+        emu.insns = 10 * crate::HEADLESS_INSNS_PER_MS;
+
+        assert_eq!(
+            hle_peek_message_a(&mut emu, &dummy_entry(hle_peek_message_a)),
+            HleResult::Retn(20)
+        );
+
+        assert_eq!(emu.cpu.reg(Reg::Eax), 0);
+        assert!(emu.hle.app_messages.is_empty());
+        assert_eq!(emu.hle.timers[0].due_count, 0);
+
+        emu.service_guest().unwrap();
+        assert_eq!(emu.hle.app_messages.len(), 1);
+        assert_eq!(emu.hle.app_messages[0].msg, 0x0113);
+        assert_eq!(emu.hle.timers[0].due_count, 1);
+    }
+
+    #[test]
+    fn get_message_quit_returns_zero_and_removes_message() {
+        let mut emu = Emulator::new();
+        prepare_hle_stack(&mut emu);
+        write_arg(&mut emu, 0, TEST_DATA);
+        write_arg(&mut emu, 1, 0);
+        write_arg(&mut emu, 2, 0);
+        write_arg(&mut emu, 3, 0);
+        emu.hle.app_messages.push(test_message(0, 0x0012, 7));
+
+        assert_eq!(
+            hle_get_message_a(&mut emu, &dummy_entry(hle_get_message_a)),
+            HleResult::Retn(16)
+        );
+
+        assert_eq!(emu.cpu.reg(Reg::Eax), 0);
+        assert_eq!(emu.memory.read_u32(TEST_DATA + 4).unwrap(), 0x0012);
+        assert!(emu.hle.app_messages.is_empty());
+    }
+
+    #[test]
+    fn message_filter_matches_child_window_and_message_range() {
+        let mut emu = Emulator::new();
+        register_test_window(&mut emu, 0x0002_0001, 0, 0x0040_1000);
+        register_test_window(&mut emu, 0x0002_0005, 0x0002_0001, 0x0040_1000);
+        emu.hle
+            .app_messages
+            .push(test_message(0x0002_0005, 0x0111, 0x77));
+
+        assert!(emu
+            .hle
+            .has_matching_message(MessageFilter::new(0x0002_0001, 0x0100, 0x0200)));
+        assert!(!emu
+            .hle
+            .has_matching_message(MessageFilter::new(0x0002_0009, 0x0100, 0x0200)));
+        assert!(!emu
+            .hle
+            .has_matching_message(MessageFilter::new(0x0002_0001, 0x0201, 0x0201)));
+    }
+
     #[test]
     fn translate_accelerator_queues_command_for_matching_key() {
         let mut emu = Emulator::new();
@@ -1739,9 +1796,7 @@ mod tests {
             emu.hle_tasks[0].wait,
             HleWaitState::Message {
                 out: TEST_DATA,
-                hwnd: 0,
-                min: 0,
-                max: 0,
+                filter: MessageFilter { hwnd: 0, min: 0, max: 0 },
             }
         ));
         assert_eq!(emu.cpu.eip, addr);
@@ -1760,7 +1815,7 @@ mod tests {
     }
 
     #[test]
-    fn multimedia_timer_callback_injection_preserves_peek_stack() {
+    fn multimedia_timer_interrupt_injection_preserves_guest_stack() {
         let mut emu = Emulator::new();
         emu.memory
             .map(TEST_STACK, 0x2000, PagePerm::READ | PagePerm::WRITE)
@@ -1770,17 +1825,14 @@ mod tests {
             .write_u32(TEST_STACK + 0x800, 0x0040_1000)
             .unwrap();
         emu.guest_time_ms = 20;
-        let id = emu.hle.set_mm_timer(20, 0x0040_1f2d, 0xfeed, 1, 0);
-        let entry = HleEntry {
-            addr: 0x7000_0100,
-            dll: "user32.dll",
-            name: "PeekMessageA",
-            callback: hle_peek_message_a,
-        };
+        let target = emu.hle.delay_target(20, 0);
+        let id = emu
+            .hle
+            .set_mm_timer(0x0040_1f2d, 0xfeed, 1, 0, 0, target);
 
-        assert!(dispatch_due_mm_timer_callback(&mut emu, &entry, 20, 0));
+        assert!(dispatch_due_mm_timer_interrupt(&mut emu));
 
-        let callback_esp = TEST_STACK + 0x7fc;
+        let callback_esp = TEST_STACK + 0x7e8;
         assert_eq!(emu.cpu.eip, 0x0040_1f2d);
         assert_eq!(emu.cpu.reg(Reg::Esp), callback_esp);
         assert_eq!(
@@ -1790,15 +1842,6 @@ mod tests {
         assert_eq!(emu.memory.read_u32(callback_esp + 4).unwrap(), id);
         assert_eq!(emu.memory.read_u32(callback_esp + 8).unwrap(), 0);
         assert_eq!(emu.memory.read_u32(callback_esp + 12).unwrap(), 0xfeed);
-        assert_eq!(emu.memory.read_u32(callback_esp + 24).unwrap(), 0x0040_1000);
-
-        emu.cpu.eip = emu.hle.async_return_thunk();
-        emu.cpu.set_reg(Reg::Esp, callback_esp + 24);
-        emu.cpu.set_reg(Reg::Eax, 0xffff_ffff);
-        assert_eq!(Hle::dispatch(&mut emu).unwrap(), None);
-        assert_eq!(emu.cpu.eip, 0x0040_1000);
-        assert_eq!(emu.cpu.reg(Reg::Esp), TEST_STACK + 0x818);
-        assert_eq!(emu.cpu.reg(Reg::Eax), 0);
     }
 
     #[test]

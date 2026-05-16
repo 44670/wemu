@@ -1,11 +1,8 @@
 // DWORD GetTickCount(void)
-// Return the guest millisecond clock and run due async MM timers at this HLE boundary.
-fn hle_get_tick_count(emu: &mut Emulator, entry: &HleEntry) -> HleResult {
+// Return the guest millisecond clock.
+fn hle_get_tick_count(emu: &mut Emulator, _: &HleEntry) -> HleResult {
     emu.refresh_guest_time();
     let now = emu.guest_time_ms as u32;
-    if dispatch_due_mm_timer_callback(emu, entry, 0, now) {
-        return HleResult::Retn(0);
-    }
     ret(emu, now);
     HleResult::Retn(0)
 }

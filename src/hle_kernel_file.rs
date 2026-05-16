@@ -30,74 +30,31 @@ fn hle_create_file_a(emu: &mut Emulator, _: &HleEntry) -> HleResult {
     let raw_name = emu.memory.cstr_lossy(name, 1024).unwrap_or_default();
     let access = arg(emu, 1);
     let creation = arg(emu, 4);
-    let wants_write = (access & 0x4000_0000) != 0;
-    let wants_read = (access & 0x8000_0000) != 0 || !wants_write;
-    match emu.hle.open_virtual_file(&raw_name, access, creation) {
-        VirtualOpen::Opened(h) => {
+    create_file_impl(emu, "CreateFileA", &raw_name, access, creation)
+}
+
+fn create_file_impl(
+    emu: &mut Emulator,
+    api_name: &str,
+    raw_name: &str,
+    access: u32,
+    creation: u32,
+) -> HleResult {
+    match emu.hle.open_file_handle(raw_name, access, creation) {
+        FileOpen::Opened(h) => {
             trace_fs!(
-                "CreateFileA name={raw_name:?} access={access:08x} create={creation} -> virtual handle={h:08x}"
+                "{api_name} name={raw_name:?} access={access:08x} create={creation} -> handle={h:08x}"
             );
             if emu.should_trace() {
-                eprintln!("CreateFileA {raw_name:?} => virtual -> {h:08x}");
+                eprintln!("{api_name} {raw_name:?} -> {h:08x}");
             }
             ret(emu, h);
-            return HleResult::Retn(28);
         }
-        VirtualOpen::Failed(last_error) => {
+        FileOpen::Failed(last_error) => {
             emu.hle.last_error = last_error;
             trace_fs!(
-                "CreateFileA name={raw_name:?} access={access:08x} create={creation} -> failed last_error={last_error}"
+                "{api_name} name={raw_name:?} access={access:08x} create={creation} -> failed last_error={last_error}"
             );
-            ret(emu, INVALID_HANDLE_VALUE);
-            return HleResult::Retn(28);
-        }
-        VirtualOpen::Miss => {}
-    }
-    let path = emu.hle.translate_path(&emu.memory, name).hle();
-    match open_host_file_candidates(&raw_name, &path, wants_read, wants_write, creation) {
-        Ok((file, opened_path)) => {
-            let h = emu.hle.alloc_handle(Handle::File(FileHandle::host(
-                emu.hle.guest_path_key(&raw_name),
-                file,
-                wants_write,
-            )));
-            trace_fs!(
-                "CreateFileA name={raw_name:?} access={access:08x} create={creation} host={opened_path:?} -> handle={h:08x}"
-            );
-            if emu.should_trace() {
-                eprintln!("CreateFileA {raw_name:?} => {:?} -> {h:08x}", opened_path);
-            }
-            ret(emu, h);
-        }
-        Err((tried_path, err)) => {
-            if wants_write
-                && err.kind() == std::io::ErrorKind::NotFound
-                && flattened_legacy_root_path(&raw_name, &path)
-                    .and_then(|flat| case_insensitive_existing_path(&flat))
-                    .is_some()
-            {
-                let h = create_virtual_scratch_file(emu, &raw_name);
-                trace_fs!(
-                    "CreateFileA name={raw_name:?} access={access:08x} create={creation} host={tried_path:?} -> virtual overlay handle={h:08x}"
-                );
-                ret(emu, h);
-                return HleResult::Retn(28);
-            }
-            emu.hle.last_error = if err.kind() == std::io::ErrorKind::NotFound {
-                2
-            } else {
-                5
-            };
-            trace_fs!(
-                "CreateFileA name={raw_name:?} access={access:08x} create={creation} host={tried_path:?} -> failed {err} last_error={}",
-                emu.hle.last_error
-            );
-            if emu.should_trace() {
-                eprintln!(
-                    "CreateFileA {raw_name:?} => {:?} failed: {} (last_error={})",
-                    tried_path, err, emu.hle.last_error
-                );
-            }
             ret(emu, INVALID_HANDLE_VALUE);
         }
     }
@@ -170,10 +127,7 @@ fn hle_write_file(emu: &mut Emulator, _: &HleEntry) -> HleResult {
                 return HleResult::Retn(20);
             }
             FileWriteResult::Pending { key, offset, data } => {
-                if let Some(entry) = emu.hle.async_vfs_entries.get_mut(&key) {
-                    entry.size = entry.size.max(offset.saturating_add(data.len() as u64));
-                    entry.writable = true;
-                }
+                emu.hle.note_async_vfs_write(&key, offset, data.len());
                 let request_id = emu.hle.begin_vfs_write(&key, offset, data);
                 return HleResult::Wait(HleWaitState::VfsWrite {
                     request_id,
@@ -488,10 +442,7 @@ fn hle_lwrite(emu: &mut Emulator, _: &HleEntry) -> HleResult {
                 return HleResult::Retn(12);
             }
             FileWriteResult::Pending { key, offset, data } => {
-                if let Some(entry) = emu.hle.async_vfs_entries.get_mut(&key) {
-                    entry.size = entry.size.max(offset.saturating_add(data.len() as u64));
-                    entry.writable = true;
-                }
+                emu.hle.note_async_vfs_write(&key, offset, data.len());
                 let request_id = emu.hle.begin_vfs_write(&key, offset, data);
                 return HleResult::Wait(HleWaitState::VfsWrite {
                     request_id,
@@ -571,31 +522,22 @@ fn hle_get_logical_drive_strings_a(emu: &mut Emulator, _: &HleEntry) -> HleResul
 // Translate and remove a host file, returning Win32-style success.
 fn hle_delete_file_a(emu: &mut Emulator, _: &HleEntry) -> HleResult {
     let raw = emu.memory.cstr_lossy(arg(emu, 0), 1024).hle();
-    if let Some(deleted) = emu.hle.delete_virtual_file(&raw) {
-        ret(emu, deleted as u32);
-        return HleResult::Retn(4);
-    }
-    let path = emu.hle.translate_path(&emu.memory, arg(emu, 0)).hle();
-    let deleted = fs::remove_file(&path).is_ok();
-    ret(emu, deleted as u32);
+    let deleted = delete_file_impl(&mut emu.hle, &raw) as u32;
+    ret(emu, deleted);
     HleResult::Retn(4)
 }
 
 // BOOL DeleteFileW(LPCWSTR name)
 // Translate and remove a host or virtual file from a wide guest path.
 fn hle_delete_file_w(emu: &mut Emulator, _: &HleEntry) -> HleResult {
-    let raw = emu
-        .memory
-        .utf16z_lossy(arg(emu, 0), 1024)
-        .unwrap_or_default();
-    if let Some(deleted) = emu.hle.delete_virtual_file(&raw) {
-        ret(emu, deleted as u32);
-        return HleResult::Retn(4);
-    }
-    let path = emu.hle.translate_raw_path(&raw).hle();
-    let deleted = fs::remove_file(&path).is_ok();
-    ret(emu, deleted as u32);
+    let raw = emu.memory.utf16z_lossy(arg(emu, 0), 1024).unwrap_or_default();
+    let deleted = delete_file_impl(&mut emu.hle, &raw) as u32;
+    ret(emu, deleted);
     HleResult::Retn(4)
+}
+
+fn delete_file_impl(hle: &mut Hle, raw: &str) -> bool {
+    hle.delete_file_path(raw)
 }
 
 // BOOL MoveFileA(LPCSTR old, LPCSTR new)
@@ -603,13 +545,7 @@ fn hle_delete_file_w(emu: &mut Emulator, _: &HleEntry) -> HleResult {
 fn hle_move_file_a(emu: &mut Emulator, _: &HleEntry) -> HleResult {
     let raw_from = emu.memory.cstr_lossy(arg(emu, 0), 1024).hle();
     let raw_to = emu.memory.cstr_lossy(arg(emu, 1), 1024).hle();
-    if let Some(moved) = emu.hle.move_virtual_file(&raw_from, &raw_to) {
-        ret(emu, moved as u32);
-        return HleResult::Retn(8);
-    }
-    let from = emu.hle.translate_path(&emu.memory, arg(emu, 0)).hle();
-    let to = emu.hle.translate_path(&emu.memory, arg(emu, 1)).hle();
-    let moved = fs::rename(&from, &to).is_ok();
+    let moved = move_file_impl(&mut emu.hle, &raw_from, Some(&raw_to), 0);
     ret(emu, moved as u32);
     HleResult::Retn(8)
 }
@@ -617,38 +553,29 @@ fn hle_move_file_a(emu: &mut Emulator, _: &HleEntry) -> HleResult {
 // BOOL MoveFileExA(LPCSTR old, LPCSTR new, DWORD flags)
 // Translate paths and rename/delete host files with replace-existing support.
 fn hle_move_file_ex_a(emu: &mut Emulator, _: &HleEntry) -> HleResult {
-    const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
     let raw_from = emu.memory.cstr_lossy(arg(emu, 0), 1024).hle();
     let new_addr = arg(emu, 1);
     let flags = arg(emu, 2);
     if new_addr == 0 {
-        if let Some(deleted) = emu.hle.delete_virtual_file(&raw_from) {
-            ret(emu, deleted as u32);
-            return HleResult::Retn(12);
-        }
-        let from = emu.hle.translate_raw_path(&raw_from).hle();
-        ret(emu, fs::remove_file(from).is_ok() as u32);
-        return HleResult::Retn(12);
-    }
-    let raw_to = emu.memory.cstr_lossy(new_addr, 1024).hle();
-    if let Some(moved) = emu.hle.move_virtual_file(&raw_from, &raw_to) {
+        let moved = move_file_impl(&mut emu.hle, &raw_from, None, flags);
         ret(emu, moved as u32);
         return HleResult::Retn(12);
     }
-    let from = emu.hle.translate_raw_path(&raw_from).hle();
-    let to = emu.hle.translate_raw_path(&raw_to).hle();
-    if (flags & MOVEFILE_REPLACE_EXISTING) != 0 && to.exists() {
-        let _ = fs::remove_file(&to);
-    }
-    ret(emu, fs::rename(from, to).is_ok() as u32);
+    let raw_to = emu.memory.cstr_lossy(new_addr, 1024).hle();
+    let moved = move_file_impl(&mut emu.hle, &raw_from, Some(&raw_to), flags);
+    ret(emu, moved as u32);
     HleResult::Retn(12)
+}
+
+fn move_file_impl(hle: &mut Hle, raw_from: &str, raw_to: Option<&str>, flags: u32) -> bool {
+    hle.move_file_path(raw_from, raw_to, flags)
 }
 
 // BOOL CreateDirectoryA(LPCSTR path, LPSECURITY_ATTRIBUTES attrs)
 // Create a translated host directory under the mounted filesystem.
 fn hle_create_directory_a(emu: &mut Emulator, _: &HleEntry) -> HleResult {
     let raw = emu.memory.cstr_lossy(arg(emu, 0), 1024).hle();
-    if emu.hle.virtual_fs_enabled {
+    if emu.hle.virtual_fs_enabled() {
         ret(emu, 1);
         return HleResult::Retn(8);
     }
@@ -665,7 +592,7 @@ fn hle_create_directory_a(emu: &mut Emulator, _: &HleEntry) -> HleResult {
 // Remove an empty translated host directory.
 fn hle_remove_directory_a(emu: &mut Emulator, _: &HleEntry) -> HleResult {
     let raw = emu.memory.cstr_lossy(arg(emu, 0), 1024).hle();
-    if emu.hle.virtual_fs_enabled {
+    if emu.hle.virtual_fs_enabled() {
         ret(emu, 1);
         return HleResult::Retn(4);
     }
@@ -678,117 +605,65 @@ fn hle_remove_directory_a(emu: &mut Emulator, _: &HleEntry) -> HleResult {
 // Accept attribute changes for existing translated files and directories.
 fn hle_set_file_attributes_a(emu: &mut Emulator, _: &HleEntry) -> HleResult {
     let raw = emu.memory.cstr_lossy(arg(emu, 0), 1024).hle();
-    if let Some(attrs) = emu.hle.virtual_file_attributes(&raw) {
-        ret(emu, (attrs != INVALID_HANDLE_VALUE) as u32);
-        return HleResult::Retn(8);
-    }
-    let path = emu.hle.translate_raw_path(&raw).hle();
-    ret(emu, path.exists() as u32);
+    let ok = emu.hle.set_file_attributes_path(&raw) as u32;
+    ret(emu, ok);
     HleResult::Retn(8)
 }
 
 // HANDLE FindFirstFileA(LPCSTR pattern, WIN32_FIND_DATAA *out)
-// Enumerate mounted host directory entries matching a DOS wildcard pattern.
+// Enumerate host and virtual directory entries matching a DOS wildcard pattern.
 fn hle_find_first_file_a(emu: &mut Emulator, _: &HleEntry) -> HleResult {
     let raw = emu.memory.cstr_lossy(arg(emu, 0), 1024).hle();
     let out = arg(emu, 1);
-    let (dir_raw, pattern) = split_find_pattern(&raw);
-    let dir = match emu.hle.translate_raw_path(&dir_raw) {
-        Ok(dir) => dir,
-        Err(_) => {
-            emu.hle.last_error = 2;
-            trace_fs!(
-                "FindFirstFileA pattern={raw:?} dir={dir_raw:?} -> failed last_error=2"
-            );
-            ret(emu, INVALID_HANDLE_VALUE);
-            return HleResult::Retn(8);
-        }
-    };
-    let mut entries = Vec::new();
-    if let Ok(read_dir) = fs::read_dir(&dir) {
-        for entry in read_dir.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if !wildcard_match_ci(&pattern, &name) {
-                continue;
-            }
-            let Ok(meta) = entry.metadata() else {
-                continue;
-            };
-            entries.push(FindEntry {
-                name,
-                attrs: if meta.is_dir() { 0x10 } else { 0x80 },
-                size: meta.len(),
-            });
-        }
-    }
-    entries.sort_by_key(|entry| entry.name.to_ascii_lowercase());
-    if entries.is_empty() {
-        emu.hle.last_error = 2;
-        trace_fs!(
-            "FindFirstFileA pattern={raw:?} host_dir={dir:?} match={pattern:?} -> none last_error=2"
-        );
+    find_first_file_impl(emu, "FindFirstFileA", &raw, out, false, 8)
+}
+
+fn find_first_file_impl(
+    emu: &mut Emulator,
+    api_name: &str,
+    raw: &str,
+    out: u32,
+    wide: bool,
+    retn: u32,
+) -> HleResult {
+    let Some(found) = emu.hle.find_file_entries(raw) else {
+        trace_fs!("{api_name} pattern={raw:?} -> none last_error=2");
         ret(emu, INVALID_HANDLE_VALUE);
-        return HleResult::Retn(8);
+        return HleResult::Retn(retn);
+    };
+    let FindEntriesResult {
+        dir_raw,
+        pattern,
+        host_dir,
+        entries,
+    } = found;
+    if wide {
+        write_find_data_w(emu, out, &entries[0]);
+    } else {
+        write_find_data_a(emu, out, &entries[0]);
     }
-    write_find_data_a(emu, out, &entries[0]);
     let handle = emu.hle.alloc_handle(Handle::Find { entries, index: 0 });
-    trace_fs!(
-        "FindFirstFileA pattern={raw:?} host_dir={dir:?} match={pattern:?} -> handle={handle:08x}"
-    );
+    if let Some(dir) = host_dir.as_ref() {
+        trace_fs!(
+            "{api_name} pattern={raw:?} host_dir={dir:?} match={:?} -> handle={handle:08x}",
+            pattern
+        );
+    } else {
+        trace_fs!(
+            "{api_name} pattern={raw:?} dir={:?} match={:?} -> handle={handle:08x}",
+            dir_raw, pattern
+        );
+    }
     ret(emu, handle);
-    HleResult::Retn(8)
+    HleResult::Retn(retn)
 }
 
 // HANDLE FindFirstFileExW(LPCWSTR pattern, FINDEX_INFO_LEVELS level, void *out, FINDEX_SEARCH_OPS search, void *filter, DWORD flags)
-// Enumerate mounted host directory entries matching a wide DOS wildcard pattern.
+// Enumerate host and virtual directory entries matching a wide DOS wildcard pattern.
 fn hle_find_first_file_ex_w(emu: &mut Emulator, _: &HleEntry) -> HleResult {
     let raw = emu.memory.utf16z_lossy(arg(emu, 0), 1024).hle();
     let out = arg(emu, 2);
-    let (dir_raw, pattern) = split_find_pattern(&raw);
-    let dir = match emu.hle.translate_raw_path(&dir_raw) {
-        Ok(dir) => dir,
-        Err(_) => {
-            emu.hle.last_error = 2;
-            trace_fs!(
-                "FindFirstFileExW pattern={raw:?} dir={dir_raw:?} -> failed last_error=2"
-            );
-            ret(emu, INVALID_HANDLE_VALUE);
-            return HleResult::Retn(24);
-        }
-    };
-    let mut entries = Vec::new();
-    if let Ok(read_dir) = fs::read_dir(&dir) {
-        for entry in read_dir.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if !wildcard_match_ci(&pattern, &name) {
-                continue;
-            }
-            let Ok(meta) = entry.metadata() else {
-                continue;
-            };
-            entries.push(FindEntry {
-                name,
-                attrs: if meta.is_dir() { 0x10 } else { 0x80 },
-                size: meta.len(),
-            });
-        }
-    }
-    entries.sort_by_key(|entry| entry.name.to_ascii_lowercase());
-    if entries.is_empty() {
-        emu.hle.last_error = 2;
-        trace_fs!(
-            "FindFirstFileExW pattern={raw:?} host_dir={dir:?} match={pattern:?} -> none last_error=2"
-        );
-        ret(emu, INVALID_HANDLE_VALUE);
-        return HleResult::Retn(24);
-    }
-    write_find_data_w(emu, out, &entries[0]);
-    let handle = emu.hle.alloc_handle(Handle::Find { entries, index: 0 });
-    trace_fs!(
-        "FindFirstFileExW pattern={raw:?} host_dir={dir:?} match={pattern:?} -> handle={handle:08x}"
-    );
-    ret(emu, handle);
-    HleResult::Retn(24)
+    find_first_file_impl(emu, "FindFirstFileExW", &raw, out, true, 24)
 }
 
 // BOOL FindNextFileA(HANDLE find, WIN32_FIND_DATAA *out)
@@ -868,30 +743,29 @@ fn hle_find_close(emu: &mut Emulator, _: &HleEntry) -> HleResult {
 // Return minimal directory/archive attributes for translated paths.
 fn hle_get_file_attributes_a(emu: &mut Emulator, _: &HleEntry) -> HleResult {
     let raw = emu.memory.cstr_lossy(arg(emu, 0), 1024).hle();
-    if let Some(attrs) = emu.hle.virtual_file_attributes(&raw) {
-        trace_fs!(
-            "GetFileAttributesA name={raw:?} -> virtual attrs={attrs:08x}"
-        );
-        ret(emu, attrs);
-        return HleResult::Retn(4);
-    }
-    let path = emu.hle.translate_path(&emu.memory, arg(emu, 0)).hle();
-    match fs::metadata(&path) {
-        Ok(md) => {
-            let attrs = if md.is_dir() { 0x10 } else { 0x80 };
-            trace_fs!(
-                "GetFileAttributesA name={raw:?} host={path:?} -> attrs={attrs:08x}"
-            );
-            ret(emu, attrs);
-        }
-        Err(err) => {
-            trace_fs!(
-                "GetFileAttributesA name={raw:?} host={path:?} -> failed {err}"
-            );
-            ret(emu, INVALID_HANDLE_VALUE);
-        }
-    }
+    let attrs = get_file_attributes_impl(&mut emu.hle, "GetFileAttributesA", &raw);
+    ret(emu, attrs);
     HleResult::Retn(4)
+}
+
+fn get_file_attributes_impl(hle: &mut Hle, api_name: &str, raw: &str) -> u32 {
+    match get_file_attribute_info_impl(hle, api_name, raw) {
+        Some((attrs, _)) => attrs,
+        None => INVALID_HANDLE_VALUE,
+    }
+}
+
+fn get_file_attribute_info_impl(hle: &mut Hle, api_name: &str, raw: &str) -> Option<(u32, u64)> {
+    match hle.file_attribute_info(raw) {
+        Some((attrs, size)) => {
+            trace_fs!("{api_name} name={raw:?} -> attrs={attrs:08x} size={size}");
+            Some((attrs, size))
+        }
+        None => {
+            trace_fs!("{api_name} name={raw:?} -> failed last_error=2");
+            None
+        }
+    }
 }
 
 // DWORD GetFullPathNameA(LPCSTR name, DWORD len, LPSTR buf, LPSTR *filepart)
@@ -902,11 +776,7 @@ fn hle_get_full_path_name_a(emu: &mut Emulator, _: &HleEntry) -> HleResult {
     let dst = arg(emu, 2);
     let file_part = arg(emu, 3);
     let src = emu.memory.cstr_lossy(src_addr, 1024).hle();
-    let full = if src.len() >= 2 && src.as_bytes()[1] == b':' {
-        src
-    } else {
-        format!("{}:{}{}", emu.hle.cwd_drive, emu.hle.cwd_path, src)
-    };
+    let full = emu.hle.full_guest_path(&src);
     if dst != 0 && len != 0 {
         emu.memory.write_cstr(dst, &full, len).hle();
     }
@@ -924,7 +794,7 @@ fn hle_get_full_path_name_a(emu: &mut Emulator, _: &HleEntry) -> HleResult {
 fn hle_get_current_directory_a(emu: &mut Emulator, _: &HleEntry) -> HleResult {
     let len = arg(emu, 0) as usize;
     let dst = arg(emu, 1);
-    let cwd = format!("{}:{}", emu.hle.cwd_drive, emu.hle.cwd_path);
+    let cwd = emu.hle.cwd_display();
     if dst != 0 && len != 0 {
         emu.memory.write_cstr(dst, &cwd, len).hle();
     }
@@ -937,7 +807,7 @@ fn hle_get_current_directory_a(emu: &mut Emulator, _: &HleEntry) -> HleResult {
 fn hle_get_current_directory_w(emu: &mut Emulator, _: &HleEntry) -> HleResult {
     let len = arg(emu, 0) as usize;
     let dst = arg(emu, 1);
-    let cwd = format!("{}:{}", emu.hle.cwd_drive, emu.hle.cwd_path);
+    let cwd = emu.hle.cwd_display();
     if dst != 0 && len != 0 {
         emu.memory.write_utf16z(dst, &cwd, len).hle();
     }
@@ -951,7 +821,7 @@ fn hle_set_current_directory_a(emu: &mut Emulator, _: &HleEntry) -> HleResult {
     let raw = emu.memory.cstr_lossy(arg(emu, 0), 1024).hle();
     let key = emu.hle.guest_path_key(&raw);
     let mut chars = key.chars();
-    let drive = chars.next().unwrap_or(emu.hle.cwd_drive);
+    let drive = chars.next().unwrap_or_else(|| emu.hle.cwd_drive());
     let path = key
         .split_once(':')
         .map(|(_, rest)| rest.to_string())
@@ -1137,14 +1007,14 @@ fn hle_get_disk_free_space_a(emu: &mut Emulator, _: &HleEntry) -> HleResult {
 
 fn guest_root_drive_a(emu: &Emulator, root: u32) -> char {
     if root == 0 {
-        return emu.hle.cwd_drive;
+        return emu.hle.cwd_drive();
     }
     let raw = emu.memory.cstr_lossy(root, 260).unwrap_or_default();
     let bytes = raw.as_bytes();
     if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
         bytes[0].to_ascii_uppercase() as char
     } else {
-        emu.hle.cwd_drive
+        emu.hle.cwd_drive()
     }
 }
 
@@ -1474,58 +1344,7 @@ fn hle_create_file_w(emu: &mut Emulator, _: &HleEntry) -> HleResult {
     let raw_name = emu.memory.utf16z_lossy(name, 1024).unwrap_or_default();
     let access = arg(emu, 1);
     let creation = arg(emu, 4);
-    let wants_write = (access & 0x4000_0000) != 0;
-    let wants_read = (access & 0x8000_0000) != 0 || !wants_write;
-    match emu.hle.open_virtual_file(&raw_name, access, creation) {
-        VirtualOpen::Opened(h) => {
-            ret(emu, h);
-            return HleResult::Retn(28);
-        }
-        VirtualOpen::Failed(last_error) => {
-            emu.hle.last_error = last_error;
-            ret(emu, INVALID_HANDLE_VALUE);
-            return HleResult::Retn(28);
-        }
-        VirtualOpen::Miss => {}
-    }
-    let path = emu.hle.translate_raw_path(&raw_name).hle();
-    let mut opts = OpenOptions::new();
-    opts.read(wants_read).write(wants_write);
-    match creation {
-        1 => {
-            opts.create_new(true);
-        }
-        2 => {
-            opts.create(true).truncate(true);
-        }
-        3 => {}
-        4 => {
-            opts.create(true);
-        }
-        5 => {
-            opts.truncate(true);
-        }
-        _ => {}
-    }
-    match opts.open(&path) {
-        Ok(file) => {
-            let handle = emu.hle.alloc_handle(Handle::File(FileHandle::host(
-                emu.hle.guest_path_key(&raw_name),
-                file,
-                wants_write,
-            )));
-            ret(emu, handle);
-        }
-        Err(err) => {
-            emu.hle.last_error = if err.kind() == std::io::ErrorKind::NotFound {
-                2
-            } else {
-                5
-            };
-            ret(emu, INVALID_HANDLE_VALUE);
-        }
-    }
-    HleResult::Retn(28)
+    create_file_impl(emu, "CreateFileW", &raw_name, access, creation)
 }
 
 // HANDLE CreateFileMappingA(HANDLE file, void *sec, DWORD protect, DWORD hi, DWORD lo, LPCSTR name)
@@ -1615,19 +1434,8 @@ fn hle_unmap_view_of_file(emu: &mut Emulator, _: &HleEntry) -> HleResult {
 fn hle_get_file_attributes_w(emu: &mut Emulator, _: &HleEntry) -> HleResult {
     let name = arg(emu, 0);
     let raw = emu.memory.utf16z_lossy(name, 1024).unwrap_or_default();
-    if let Some(attrs) = emu.hle.virtual_file_attributes(&raw) {
-        ret(emu, attrs);
-        return HleResult::Retn(4);
-    }
-    let path = emu.hle.translate_raw_path(&raw).hle();
-    match fs::metadata(path) {
-        Ok(meta) if meta.is_dir() => ret(emu, 0x10),
-        Ok(_) => ret(emu, 0x80),
-        Err(_) => {
-            emu.hle.last_error = 2;
-            ret(emu, INVALID_HANDLE_VALUE);
-        }
-    }
+    let attrs = get_file_attributes_impl(&mut emu.hle, "GetFileAttributesW", &raw);
+    ret(emu, attrs);
     HleResult::Retn(4)
 }
 
@@ -1639,28 +1447,12 @@ fn hle_get_file_attributes_ex_w(emu: &mut Emulator, _: &HleEntry) -> HleResult {
         .utf16z_lossy(arg(emu, 0), 1024)
         .unwrap_or_default();
     let out = arg(emu, 2);
-    if let Some(attrs) = emu.hle.virtual_file_attributes(&raw) {
-        trace_fs!(
-            "GetFileAttributesExW name={raw:?} -> virtual attrs={attrs:08x}"
-        );
-        write_file_attribute_data(emu, out, attrs, 0);
-        ret(emu, 1);
-        return HleResult::Retn(12);
-    }
-    let path = emu.hle.translate_raw_path(&raw).hle();
-    match fs::metadata(&path) {
-        Ok(meta) => {
-            let attrs = if meta.is_dir() { 0x10 } else { 0x80 };
-            trace_fs!(
-                "GetFileAttributesExW name={raw:?} host={path:?} -> attrs={attrs:08x} size={}",
-                meta.len()
-            );
-            write_file_attribute_data(emu, out, attrs, meta.len());
+    match get_file_attribute_info_impl(&mut emu.hle, "GetFileAttributesExW", &raw) {
+        Some((attrs, size)) => {
+            write_file_attribute_data(emu, out, attrs, size);
             ret(emu, 1);
         }
-        Err(_) => {
-            emu.hle.last_error = 2;
-            trace_fs!("GetFileAttributesExW name={raw:?} host={path:?} -> failed last_error=2");
+        None => {
             ret(emu, 0);
         }
     }
@@ -1699,130 +1491,11 @@ fn log_create_file(line: impl AsRef<str>) {
     println!("{line}");
 }
 
-fn create_virtual_scratch_file(emu: &mut Emulator, raw_name: &str) -> u32 {
-    let key = emu.hle.guest_path_key(raw_name);
-    let data = Rc::new(RefCell::new(Vec::new()));
-    emu.hle.virtual_files.insert(key, data.clone());
-    emu.hle
-        .alloc_handle(Handle::File(FileHandle::memory(
-            emu.hle.guest_path_key(raw_name),
-            data,
-            true,
-        )))
-}
-
-fn open_host_file_candidates(
-    raw_name: &str,
-    path: &Path,
-    wants_read: bool,
-    wants_write: bool,
-    creation: u32,
-) -> std::result::Result<(File, PathBuf), (PathBuf, std::io::Error)> {
-    let mut last_err = None;
-    for candidate in host_file_candidates(raw_name, path, wants_write) {
-        let mut opts = OpenOptions::new();
-        opts.read(wants_read).write(wants_write);
-        match creation {
-            1 => {
-                opts.create_new(true);
-            }
-            2 => {
-                opts.create(true).truncate(true);
-            }
-            3 => {}
-            4 => {
-                if wants_write {
-                    opts.create(true);
-                }
-            }
-            5 => {
-                if wants_write {
-                    opts.truncate(true);
-                }
-            }
-            _ => {}
-        }
-        match opts.open(&candidate) {
-            Ok(file) => return Ok((file, candidate)),
-            Err(err) => last_err = Some((candidate, err)),
-        }
-    }
-    Err(last_err.unwrap_or_else(|| {
-        (
-            path.to_path_buf(),
-            std::io::Error::new(std::io::ErrorKind::NotFound, "no path candidates"),
-        )
-    }))
-}
-
-fn host_file_candidates(raw_name: &str, path: &Path, wants_write: bool) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    push_unique_path(&mut out, path.to_path_buf());
-    if let Some(path) = case_insensitive_existing_path(path) {
-        push_unique_path(&mut out, path);
-    }
-    if !wants_write {
-        if let Some(flat) = flattened_data_path(raw_name, path) {
-            push_unique_path(&mut out, flat.clone());
-            if let Some(path) = case_insensitive_existing_path(&flat) {
-                push_unique_path(&mut out, path);
-            }
-        }
-        if let Some(flat) = flattened_legacy_root_path(raw_name, path) {
-            push_unique_path(&mut out, flat.clone());
-            if let Some(path) = case_insensitive_existing_path(&flat) {
-                push_unique_path(&mut out, path);
-            }
-        }
-    }
-    out
-}
-
 fn open_compat_file(emu: &mut Emulator, raw: &str, access: u32, creation: u32) -> u32 {
-    let wants_write = (access & 0x4000_0000) != 0;
-    let wants_read = (access & 0x8000_0000) != 0 || !wants_write;
-    match emu.hle.open_virtual_file(raw, access, creation) {
-        VirtualOpen::Opened(h) => return h,
-        VirtualOpen::Failed(last_error) => {
+    match emu.hle.open_file_handle(raw, access, creation) {
+        FileOpen::Opened(h) => h,
+        FileOpen::Failed(last_error) => {
             emu.hle.last_error = last_error;
-            return INVALID_HANDLE_VALUE;
-        }
-        VirtualOpen::Miss => {}
-    }
-    let Ok(path) = emu.hle.translate_raw_path(raw) else {
-        emu.hle.last_error = 2;
-        return INVALID_HANDLE_VALUE;
-    };
-    let mut opts = OpenOptions::new();
-    opts.read(wants_read).write(wants_write);
-    match creation {
-        1 => {
-            opts.create_new(true);
-        }
-        2 => {
-            opts.create(true).truncate(true);
-        }
-        3 => {}
-        4 => {
-            opts.create(true);
-        }
-        5 => {
-            opts.truncate(true);
-        }
-        _ => {}
-    }
-    match opts.open(path) {
-        Ok(file) => emu.hle.alloc_handle(Handle::File(FileHandle::host(
-            emu.hle.guest_path_key(raw),
-            file,
-            wants_write,
-        ))),
-        Err(err) => {
-            emu.hle.last_error = if err.kind() == std::io::ErrorKind::NotFound {
-                2
-            } else {
-                5
-            };
             INVALID_HANDLE_VALUE
         }
     }
@@ -1894,7 +1567,12 @@ fn open_file_mapping_common(emu: &mut Emulator, name: &str) -> u32 {
 
 #[cfg(test)]
 mod kernel_file_tests {
-    use super::set_file_pointer_distance;
+    use super::{
+        delete_file_impl, get_file_attributes_impl, move_file_impl, set_file_pointer_distance,
+        INVALID_HANDLE_VALUE,
+    };
+    use super::{FileOpen, Hle};
+    use std::fs;
 
     #[test]
     fn set_file_pointer_null_high_uses_signed_long_distance() {
@@ -1912,5 +1590,96 @@ mod kernel_file_tests {
             set_file_pointer_distance(0xffff_fffc, Some(0)),
             0xffff_fffc
         );
+    }
+
+    #[test]
+    fn attributes_and_delete_share_virtual_and_host_paths() {
+        let root =
+            std::env::temp_dir().join(format!("wemu-vfs-attrs-delete-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("host.dat"), b"host").unwrap();
+
+        let mut hle = Hle::new();
+        hle.set_drive_mount('C', root.clone());
+        assert_eq!(
+            get_file_attributes_impl(&mut hle, "TestAttrs", "C:\\host.dat"),
+            0x80
+        );
+        assert!(delete_file_impl(&mut hle, "C:\\host.dat"));
+
+        let mut hle = Hle::new();
+        hle.add_virtual_file("C:\\Data\\Virtual.DAT", b"vfs");
+        assert_eq!(
+            get_file_attributes_impl(&mut hle, "TestAttrs", "C:\\Data\\Virtual.DAT"),
+            0x80
+        );
+        assert!(delete_file_impl(&mut hle, "C:\\Data\\Virtual.DAT"));
+        assert_eq!(
+            get_file_attributes_impl(&mut hle, "TestAttrs", "C:\\Data\\Virtual.DAT"),
+            INVALID_HANDLE_VALUE
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn move_file_impl_handles_host_replace_and_virtual_delete() {
+        let root = std::env::temp_dir().join(format!("wemu-vfs-move-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("from.dat"), b"from").unwrap();
+        fs::write(root.join("to.dat"), b"to").unwrap();
+
+        let mut hle = Hle::new();
+        hle.set_drive_mount('C', root.clone());
+        assert!(move_file_impl(
+            &mut hle,
+            "C:\\from.dat",
+            Some("C:\\to.dat"),
+            1
+        ));
+        assert_eq!(fs::read(root.join("to.dat")).unwrap(), b"from");
+
+        let mut hle = Hle::new();
+        hle.add_virtual_file("C:\\Data\\from.dat", b"vfs");
+        assert!(move_file_impl(
+            &mut hle,
+            "C:\\Data\\from.dat",
+            Some("C:\\Data\\to.dat"),
+            0
+        ));
+        assert_eq!(
+            get_file_attributes_impl(&mut hle, "TestAttrs", "C:\\Data\\to.dat"),
+            0x80
+        );
+        assert!(move_file_impl(&mut hle, "C:\\Data\\to.dat", None, 0));
+        assert_eq!(
+            get_file_attributes_impl(&mut hle, "TestAttrs", "C:\\Data\\to.dat"),
+            INVALID_HANDLE_VALUE
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn open_file_handle_uses_host_candidates_and_creation_dispositions() {
+        let root = std::env::temp_dir().join(format!("wemu-vfs-open-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("Mixed.DAT"), b"host").unwrap();
+
+        let mut hle = Hle::new();
+        hle.set_drive_mount('C', root.clone());
+        match hle.open_file_handle("C:\\mixed.dat", 0x8000_0000, 3) {
+            FileOpen::Opened(_) => {}
+            FileOpen::Failed(err) => panic!("case-insensitive host open failed: {err}"),
+        }
+        match hle.open_file_handle("C:\\Mixed.DAT", 0x4000_0000, 1) {
+            FileOpen::Failed(80) => {}
+            _ => panic!("CREATE_NEW existing file did not fail with ERROR_FILE_EXISTS"),
+        }
+
+        let _ = fs::remove_dir_all(root);
     }
 }

@@ -234,7 +234,6 @@ fn hle_mmio_open_a(emu: &mut Emulator, _: &HleEntry) -> HleResult {
     let info = arg(emu, 1);
     let flags = arg(emu, 2);
     let wants_write = (flags & (MMIO_WRITE | MMIO_READWRITE | MMIO_CREATE)) != 0;
-    let wants_read = (flags & MMIO_WRITE) == 0 || (flags & MMIO_READWRITE) != 0;
 
     if name == 0 {
         let buffer = if info != 0 {
@@ -264,7 +263,6 @@ fn hle_mmio_open_a(emu: &mut Emulator, _: &HleEntry) -> HleResult {
     }
 
     let raw_name = emu.memory.cstr_lossy(name, 1024).unwrap_or_default();
-    let path = emu.hle.translate_path(&emu.memory, name).hle();
     let creation = if (flags & MMIO_CREATE) != 0 { 2 } else { 3 };
     let access = if (flags & MMIO_READWRITE) != 0 {
         0xc000_0000
@@ -273,30 +271,12 @@ fn hle_mmio_open_a(emu: &mut Emulator, _: &HleEntry) -> HleResult {
     } else {
         0x8000_0000
     };
-    match emu.hle.open_virtual_file(&raw_name, access, creation) {
-        VirtualOpen::Opened(h) => {
-            mmio_write_open_info(emu, info, h, 0);
-            ret(emu, h);
-            return HleResult::Retn(12);
-        }
-        VirtualOpen::Failed(_) => {
-            mmio_write_error(emu, info, MMIOERR_CANNOTOPEN);
-            ret(emu, 0);
-            return HleResult::Retn(12);
-        }
-        VirtualOpen::Miss => {}
-    }
-    match open_host_file_candidates(&raw_name, &path, wants_read, wants_write, creation) {
-        Ok((file, _)) => {
-            let h = emu.hle.alloc_handle(Handle::File(FileHandle::host(
-                emu.hle.guest_path_key(&raw_name),
-                file,
-                wants_write,
-            )));
+    match emu.hle.open_file_handle(&raw_name, access, creation) {
+        FileOpen::Opened(h) => {
             mmio_write_open_info(emu, info, h, 0);
             ret(emu, h);
         }
-        Err(_) => {
+        FileOpen::Failed(_) => {
             mmio_write_error(emu, info, MMIOERR_CANNOTOPEN);
             ret(emu, 0);
         }

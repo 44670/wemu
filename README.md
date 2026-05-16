@@ -126,6 +126,16 @@ cargo run --release --features sdl2 -- \
   --frontend sdl2
 ```
 
+Native CLI can also mount a browser-style game ZIP directly. ZIP contents are
+exposed under `C:\mnt`, matching the web frontend. If the archive has exactly
+one `.exe`, `--cmdline` may be omitted; otherwise pass the guest executable path
+shown in the error message.
+
+```bash
+cargo run --release -- \
+  --zip /path/to/game.zip
+```
+
 
 ## Web Frontend
 

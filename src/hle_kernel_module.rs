@@ -424,6 +424,25 @@ fn load_library_common(emu: &mut Emulator, name: &str) -> u32 {
         return h;
     }
     for load_name in module_load_names(name) {
+        let key = emu.hle.guest_path_key(&load_name);
+        if let Some(bytes) = emu.hle.virtual_file_bytes(&key) {
+            match crate::pe::load_pe32_dll_bytes(PathBuf::from(&key), &bytes, &mut emu.memory, &mut emu.hle) {
+                Ok(image) => {
+                    let h = image.image_base;
+                    emu.hle.module_images.insert(h, image);
+                    register_module_aliases(emu, h, name);
+                    register_module_aliases(emu, h, &load_name);
+                    if let Some(file_name) = key.rsplit('\\').next() {
+                        register_module_aliases(emu, h, file_name);
+                    }
+                    emu.hle
+                        .check_strict_hle_imports()
+                        .unwrap_or_else(|err| panic!("{err}"));
+                    return h;
+                }
+                Err(err) => trace_fs!("LoadLibrary virtual image {key:?} failed: {err}"),
+            }
+        }
         let Ok(path) = emu.hle.translate_raw_path(&load_name) else {
             continue;
         };

@@ -3,6 +3,7 @@ use std::slice;
 
 use wemu::backend::{BackendEvent, HeadlessBackend};
 use wemu::cpu::Reg;
+use wemu::guest_path::GuestPath;
 use wemu::memory::{GUEST_RAM_BASE, GUEST_RAM_END};
 use wemu::{png, Emulator, Error, Result, StopReason, DEFAULT_FRAME_TIMEOUT_MS};
 
@@ -70,12 +71,31 @@ pub extern "C" fn wemu_new(width: u32, height: u32) -> u32 {
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn wemu_set_frontend_timing(
+    handle: u32,
+    fps: u32,
+    microseconds_per_frame: u32,
+) -> i32 {
+    let Some(wasm) = (unsafe { instance_mut(handle) }) else {
+        return -1;
+    };
+    wasm.emu
+        .set_frontend_timing(fps, microseconds_per_frame as u64);
+    0
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn wemu_destroy(handle: u32) {
     if handle != 0 {
         unsafe {
             drop(Box::from_raw(handle as usize as *mut WasmEmulator));
         }
     }
+}
+
+#[no_mangle]
+pub extern "C" fn wemu_set_hle_trace_flags(flags: u32) {
+    wemu::hle::set_hle_trace_flags(flags);
 }
 
 #[no_mangle]
@@ -174,6 +194,21 @@ pub unsafe extern "C" fn wemu_add_async_file(
             wasm.emu
                 .hle
                 .add_async_virtual_file(&path, size, writable != 0);
+            Ok(0)
+        })()
+    };
+    finish_i32(wasm, result)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn wemu_guest_path_key(handle: u32, path_ptr: u32, path_len: u32) -> i32 {
+    let Some(wasm) = instance_mut(handle) else {
+        return -1;
+    };
+    let result = unsafe {
+        (|| -> Result<i32> {
+            let path = read_string(path_ptr, path_len)?;
+            wasm.last_blob = wasm.emu.hle.vfs_key_for_guest(&path).into_bytes();
             Ok(0)
         })()
     };
@@ -652,22 +687,7 @@ fn finish_i32(wasm: &mut WasmEmulator, result: Result<i32>) -> i32 {
 }
 
 fn guest_parent_dir(path: &str) -> (char, String) {
-    let normalized = path.replace('/', "\\");
-    let bytes = normalized.as_bytes();
-    let absolute_drive = bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic();
-    let drive = if absolute_drive {
-        bytes[0].to_ascii_uppercase() as char
-    } else {
-        'C'
-    };
-    let rest = if absolute_drive {
-        &normalized[2..]
-    } else {
-        normalized.as_str()
-    };
-    let parent = rest.rfind('\\').map(|pos| &rest[..pos]).unwrap_or("\\");
-    let parent = if parent.is_empty() { "\\" } else { parent };
-    (drive, parent.to_string())
+    GuestPath::resolve(path, 'C', "\\").parent_dir()
 }
 
 fn stop_code(stop: StopReason) -> i32 {

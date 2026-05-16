@@ -906,47 +906,24 @@ fn system_parameters_info_impl(emu: &mut Emulator) {
 // Block cooperatively until a queued message or frontend stop exists.
 fn hle_get_message_a(emu: &mut Emulator, _: &HleEntry) -> HleResult {
     let out = arg(emu, 0);
-    let hwnd = arg(emu, 1);
-    let min = arg(emu, 2);
-    let max = arg(emu, 3);
+    let filter = MessageFilter::new(arg(emu, 1), arg(emu, 2), arg(emu, 3));
 
-    if !has_matching_message(emu, hwnd, min, max) {
-        emu.reschedule_message_pump().hle();
+    if !emu.hle.has_matching_message(filter) {
+        emu.poll_frontend_events_no_timers().hle();
         if emu.stopped.is_some() {
             ret(emu, 0);
             return HleResult::Retn(16);
         }
     }
 
-    let input_index = matching_message_index(emu, &emu.hle.input_messages, hwnd, min, max);
-    let app_index = if input_index.is_none() {
-        matching_message_index(emu, &emu.hle.app_messages, hwnd, min, max)
-    } else {
-        None
-    };
-    let message = input_index
-        .map(|index| (true, index, emu.hle.input_messages[index]))
-        .or_else(|| app_index.map(|index| (false, index, emu.hle.app_messages[index])));
-    if let Some((from_input, index, message)) = message {
-        let source = if from_input {
-            "GetMessage-input"
-        } else {
-            "GetMessage-app"
-        };
-        emu.hle.note_peek_message(source, 1, Some(message));
-        if out != 0 {
-            write_msg(emu, out, message);
-        }
-        emu.hle.note_generated_paint_delivered(message);
-        if from_input {
-            emu.hle.input_messages.remove(index);
-            emu.hle.note_removed_message(source, message);
-        } else if message.msg != 0x000f {
-            emu.hle.app_messages.remove(index);
-            emu.hle.note_removed_message(source, message);
-        } else {
-            emu.hle.note_peek_message(source, 0, Some(message));
-        }
+    if let Some(message) = poll_message(
+        emu,
+        out,
+        filter,
+        true,
+        "GetMessage-input",
+        "GetMessage-app",
+    ) {
         ret(emu, if message.msg == 0x0012 { 0 } else { 1 });
         return HleResult::Retn(16);
     }
@@ -954,10 +931,33 @@ fn hle_get_message_a(emu: &mut Emulator, _: &HleEntry) -> HleResult {
     emu.hle.note_peek_message("GetMessage-none", 1, None);
     HleResult::Wait(HleWaitState::Message {
         out,
-        hwnd,
-        min,
-        max,
+        filter,
     })
+}
+
+fn poll_message(
+    emu: &mut Emulator,
+    out: u32,
+    filter: MessageFilter,
+    remove: bool,
+    input_source: &'static str,
+    app_source: &'static str,
+) -> Option<Message> {
+    let queued = emu.hle.matching_queued_message(filter)?;
+    let source = match queued.kind {
+        MessageQueueKind::Input => input_source,
+        MessageQueueKind::App => app_source,
+    };
+    emu.hle
+        .note_peek_message(source, remove as u32, Some(queued.message));
+    if out != 0 {
+        write_msg(emu, out, queued.message);
+    }
+    emu.hle.note_generated_paint_delivered(queued.message);
+    if remove {
+        emu.hle.remove_queued_message(queued, source);
+    }
+    Some(queued.message)
 }
 
 // void PostQuitMessage(int code)
@@ -983,10 +983,15 @@ fn hle_set_timer(emu: &mut Emulator, _: &HleEntry) -> HleResult {
     let requested = arg(emu, 1);
     let elapse = arg(emu, 2);
     let proc = arg(emu, 3);
-    emu.refresh_guest_time();
-    let id = emu
-        .hle
-        .set_timer(hwnd, requested, elapse, proc, emu.guest_time_ms);
+    let target = emu.delay_target(elapse);
+    let id = emu.hle.set_timer(
+        hwnd,
+        requested,
+        proc,
+        emu.guest_time_ms,
+        emu.current_scheduler_frame(),
+        target,
+    );
     trace_gdi!(
         "user SetTimer hwnd={hwnd:08x} requested={requested:08x} elapse={elapse} proc={proc:08x} -> {id:08x}"
     );
@@ -3239,43 +3244,11 @@ fn window_has_hle_frame(window: &HleWindow) -> bool {
     style_has_hle_frame(window.style)
 }
 
-fn dispatch_due_mm_timer_callback(
-    emu: &mut Emulator,
-    entry: &HleEntry,
-    hle_arg_bytes: u32,
-    hle_return_value: u32,
-) -> bool {
-    let Some(timer) = emu.hle.take_due_mm_timer(emu.guest_time_ms) else {
-        return false;
-    };
-    let hle_esp = emu.cpu.reg(Reg::Esp);
-    let original_ret = emu.memory.read_u32(hle_esp).hle();
-    let callback_esp = hle_esp.wrapping_add(hle_arg_bytes).wrapping_sub(24);
-    let async_return = emu.hle.async_return_thunk();
-    emu.memory.write_u32(callback_esp, async_return).hle();
-    emu.memory.write_u32(callback_esp + 4, timer.id).hle();
-    emu.memory.write_u32(callback_esp + 8, 0).hle();
-    emu.memory.write_u32(callback_esp + 12, timer.user).hle();
-    emu.memory.write_u32(callback_esp + 16, 0).hle();
-    emu.memory.write_u32(callback_esp + 20, 0).hle();
-    emu.memory.write_u32(callback_esp + 24, original_ret).hle();
-    emu.hle.push_hle_callback_return(hle_return_value);
-    emu.cpu
-        .debug_replace_top_call(
-            entry.addr,
-            timer.callback,
-            async_return,
-            callback_esp + 4,
-            callback_esp,
-        )
-        .hle();
-    emu.cpu.set_reg(Reg::Esp, callback_esp);
-    emu.cpu.eip = timer.callback;
-    true
-}
-
 pub(crate) fn dispatch_due_mm_timer_interrupt(emu: &mut Emulator) -> bool {
-    let Some(timer) = emu.hle.take_due_mm_timer(emu.guest_time_ms) else {
+    let Some(timer) = emu
+        .hle
+        .take_due_mm_timer(emu.guest_time_ms, emu.current_scheduler_frame())
+    else {
         return false;
     };
     let saved_cpu = emu.cpu.clone();
@@ -4178,54 +4151,6 @@ fn rect_contains(outer: WindowRect, inner: WindowRect) -> bool {
         && outer.top <= inner.top
         && outer.right >= inner.right
         && outer.bottom >= inner.bottom
-}
-
-fn has_matching_message(emu: &Emulator, hwnd: u32, min: u32, max: u32) -> bool {
-    matching_message_index(emu, &emu.hle.input_messages, hwnd, min, max).is_some()
-        || matching_message_index(emu, &emu.hle.app_messages, hwnd, min, max).is_some()
-}
-
-fn matching_message_index(
-    emu: &Emulator,
-    messages: &[Message],
-    hwnd: u32,
-    min: u32,
-    max: u32,
-) -> Option<usize> {
-    messages
-        .iter()
-        .position(|message| message_matches_filter(emu, *message, hwnd, min, max))
-}
-
-fn message_matches_filter(emu: &Emulator, message: Message, hwnd: u32, min: u32, max: u32) -> bool {
-    !emu.hle.paint_message_suppressed_this_frame(message)
-        && message_hwnd_matches(emu, message.hwnd, hwnd)
-        && message_id_matches(message.msg, min, max)
-}
-
-fn message_hwnd_matches(emu: &Emulator, mut message_hwnd: u32, hwnd_filter: u32) -> bool {
-    if hwnd_filter == 0 {
-        return true;
-    }
-    if hwnd_filter == 0xffff_ffff {
-        return message_hwnd == 0;
-    }
-    loop {
-        if message_hwnd == hwnd_filter {
-            return true;
-        }
-        let Some(parent) = emu.hle.window(message_hwnd).map(|window| window.parent) else {
-            return false;
-        };
-        if parent == 0 {
-            return false;
-        }
-        message_hwnd = parent;
-    }
-}
-
-fn message_id_matches(msg: u32, min: u32, max: u32) -> bool {
-    (min == 0 && max == 0) || (msg >= min && msg <= max)
 }
 
 fn remove_pending_paint_message(emu: &mut Emulator, hwnd: u32) {

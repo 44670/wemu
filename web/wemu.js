@@ -1,8 +1,9 @@
-import * as zip from "https://cdn.jsdelivr.net/npm/@zip.js/zip.js@2.8.26/index.min.js";
+import * as zip from "./zip.min.js";
 
 const WASM_URL = new URL("./wemu.wasm", import.meta.url);
-const TARGET_FPS = 30;
-const FRAME_INTERVAL_MS = 1000 / TARGET_FPS;
+const SCHEDULER_FPS = 30;
+const SCHEDULER_FRAME_INTERVAL_MS = 1000 / SCHEDULER_FPS;
+const SCHEDULER_MICROSECONDS_PER_FRAME = Math.round(1_000_000 / SCHEDULER_FPS);
 const IN_MEMORY_ZIP_LIMIT = 64 * 1024 * 1024;
 const LOG_PREFIX = "[wemu]";
 const SLOW_FRAME_LOG_MS = 100;
@@ -377,6 +378,14 @@ class Wemu {
     if (!handle) {
       throw new Error("wemu_new failed");
     }
+    const timingRc = api.wemu_set_frontend_timing(
+      handle,
+      SCHEDULER_FPS,
+      SCHEDULER_MICROSECONDS_PER_FRAME,
+    );
+    if (timingRc < 0) {
+      throw new Error("wemu_set_frontend_timing failed");
+    }
     logInfo("emulator created", { handle, ms: Math.round(performance.now() - started) });
     return new Wemu(api, handle);
   }
@@ -441,6 +450,16 @@ class Wemu {
 
   enableAsyncVfsWrites() {
     this.check(this.api.wemu_enable_async_vfs_writes(this.handle), "enable async VFS writes");
+  }
+
+  guestPathKey(guestPath) {
+    return this.withString(guestPath, (pathPtr, pathLen) => {
+      this.check(this.api.wemu_guest_path_key(this.handle, pathPtr, pathLen), `key ${guestPath}`);
+      return this.readString(
+        this.api.wemu_blob_ptr(this.handle),
+        this.api.wemu_blob_len(this.handle),
+      );
+    });
   }
 
   setVfs(vfs) {
@@ -866,6 +885,31 @@ function errDispStopKind(code) {
   }
 }
 
+function errDispHasMissingHle(report) {
+  return Boolean(report?.runtime?.missingHle) || /missing HLE/i.test(report?.message || "");
+}
+
+function errDispIsCpuError(report) {
+  const message = report?.message || "";
+  const wasmLastError = report?.runtime?.wasmLastError || "";
+  return report?.kind === "cpu_halted" ||
+    /(^|:\s*)cpu error:/i.test(message) ||
+    /(^|:\s*)cpu error:/i.test(wasmLastError);
+}
+
+function errDispTitle(report) {
+  if (errDispHasMissingHle(report)) {
+    return "HLE API Not Implemented";
+  }
+  if (report?.kind === "process_exit") {
+    return "Process Exited";
+  }
+  if (errDispIsCpuError(report)) {
+    return "CPU Error";
+  }
+  return ERR_DISP_FEATURE;
+}
+
 function safeRead(fn, fallback = null) {
   try {
     return fn();
@@ -1017,7 +1061,7 @@ function errDispShow(report) {
   lastErrDispReport = report;
   const json = JSON.stringify(report, null, 2);
   if (els.errDispTitle) {
-    els.errDispTitle.textContent = ERR_DISP_FEATURE;
+    els.errDispTitle.textContent = errDispTitle(report);
   }
   if (els.errDispSummary) {
     els.errDispSummary.textContent = `${report.kind}: ${report.message}`;
@@ -1028,7 +1072,7 @@ function errDispShow(report) {
   if (els.errDispReportButton) {
     els.errDispReportButton.disabled = !errDispReportUrl;
   }
-  errDispSetReportStatus(errDispReportUrl ? "Report queued" : "Report endpoint is not configured");
+  errDispSetReportStatus(errDispReportUrl ? "Report ready" : "Report endpoint is not configured");
   if (els.errDispDialog?.showModal && !els.errDispDialog.open) {
     els.errDispDialog.showModal();
   }
@@ -1036,9 +1080,6 @@ function errDispShow(report) {
     logInfo(ERR_DISP_FEATURE, report);
   } else {
     console.error(`${LOG_PREFIX} ${ERR_DISP_FEATURE}`, report);
-  }
-  if (errDispReportUrl) {
-    errDispSend(report);
   }
 }
 
@@ -1056,10 +1097,6 @@ function guestPath(archivePath) {
 
 function syncPeImportPath(archivePath) {
   return /\.(dll|ocx)$/i.test(archivePath);
-}
-
-function vfsKey(path) {
-  return String(path).replaceAll("/", "\\").toLowerCase();
 }
 
 async function readArchive(file) {
@@ -1206,17 +1243,18 @@ async function openVfsDb() {
 }
 
 class ZipBaseVfs {
-  constructor(files, reader, blob, storedEntries) {
+  constructor(files, reader, blob, storedEntries, keyOf) {
     this.entries = new Map();
     this.reader = reader;
     this.blob = blob;
+    this.keyOf = keyOf;
     for (const file of files) {
       const guest = guestPath(file.path);
       const stored = storedEntries.get(file.path.toLowerCase());
       if (!stored) {
         throw new Error(`${file.path} is missing from the ZIP central directory`);
       }
-      this.entries.set(vfsKey(guest), {
+      this.entries.set(this.keyOf(guest), {
         offset: stored.offset,
         size: stored.size || zipEntrySize(file.entry),
       });
@@ -1224,11 +1262,11 @@ class ZipBaseVfs {
   }
 
   size(path) {
-    return this.entries.get(vfsKey(path))?.size ?? null;
+    return this.entries.get(this.keyOf(path))?.size ?? null;
   }
 
   async read(path, offset, len) {
-    const key = vfsKey(path);
+    const key = this.keyOf(path);
     const item = this.entries.get(key);
     if (!item) {
       return null;
@@ -1246,12 +1284,13 @@ class ZipBaseVfs {
 }
 
 class MemoryOverlayVfs {
-  constructor() {
+  constructor(keyOf) {
     this.files = new Map();
+    this.keyOf = keyOf;
   }
 
   async read(path, offset, len) {
-    const bytes = this.files.get(vfsKey(path));
+    const bytes = this.files.get(this.keyOf(path));
     if (!bytes) {
       return null;
     }
@@ -1259,7 +1298,7 @@ class MemoryOverlayVfs {
   }
 
   async write(path, offset, data, base) {
-    const key = vfsKey(path);
+    const key = this.keyOf(path);
     let bytes = this.files.get(key);
     if (!bytes) {
       const baseSize = base.size(path);
@@ -1283,8 +1322,9 @@ class MemoryOverlayVfs {
 }
 
 class IndexedDbOverlayVfs {
-  constructor(db) {
+  constructor(db, keyOf) {
     this.db = db;
+    this.keyOf = keyOf;
   }
 
   async get(key) {
@@ -1299,7 +1339,7 @@ class IndexedDbOverlayVfs {
   }
 
   async read(path, offset, len) {
-    const bytes = await this.get(vfsKey(path));
+    const bytes = await this.get(this.keyOf(path));
     if (!bytes) {
       return null;
     }
@@ -1307,7 +1347,7 @@ class IndexedDbOverlayVfs {
   }
 
   async write(path, offset, data, base) {
-    const key = vfsKey(path);
+    const key = this.keyOf(path);
     let bytes = await this.get(key);
     if (!bytes) {
       const baseSize = base.size(path);
@@ -1335,9 +1375,10 @@ class IndexedDbOverlayVfs {
 }
 
 class LayeredVfs {
-  constructor(base, overlay) {
+  constructor(base, overlay, keyOf) {
     this.base = base;
     this.overlay = overlay;
+    this.keyOf = keyOf;
   }
 
   size(path) {
@@ -1346,7 +1387,7 @@ class LayeredVfs {
 
   async sizeForRegistration(path) {
     if (this.overlay.get) {
-      const bytes = await this.overlay.get(vfsKey(path));
+      const bytes = await this.overlay.get(this.keyOf(path));
       if (bytes) {
         return bytes.length;
       }
@@ -1372,11 +1413,11 @@ class LayeredVfs {
   }
 }
 
-async function createArchiveVfs(files, reader, blob, storedEntries) {
-  const base = new ZipBaseVfs(files, reader, blob, storedEntries);
+async function createArchiveVfs(files, reader, blob, storedEntries, keyOf) {
+  const base = new ZipBaseVfs(files, reader, blob, storedEntries, keyOf);
   const db = await openVfsDb().catch(() => null);
-  const overlay = db ? new IndexedDbOverlayVfs(db) : new MemoryOverlayVfs();
-  return new LayeredVfs(base, overlay);
+  const overlay = db ? new IndexedDbOverlayVfs(db, keyOf) : new MemoryOverlayVfs(keyOf);
+  return new LayeredVfs(base, overlay, keyOf);
 }
 
 function exeTitle(path) {
@@ -1456,6 +1497,7 @@ async function mountArchive(wemu, archive, exe) {
     archive.reader,
     archive.file,
     directory.entries,
+    (path) => wemu.guestPathKey(path),
   );
   wemu.setVfs(vfs);
   wemu.enableAsyncVfsWrites();
@@ -1637,6 +1679,13 @@ async function runChunk(now) {
     scheduleRun();
     return;
   }
+  if (nextFrameAt === 0) {
+    nextFrameAt = now;
+  }
+  if (now < nextFrameAt) {
+    scheduleRun();
+    return;
+  }
   const activeRuntime = runtime;
   runFrameBusy = true;
   try {
@@ -1644,10 +1693,11 @@ async function runChunk(now) {
     if (runtime !== activeRuntime) {
       return;
     }
-    if (now >= nextFrameAt) {
-      renderFrame();
-      refreshStats();
-      nextFrameAt = now + FRAME_INTERVAL_MS;
+    renderFrame();
+    refreshStats();
+    nextFrameAt += SCHEDULER_FRAME_INTERVAL_MS;
+    if (nextFrameAt <= now) {
+      nextFrameAt = now + SCHEDULER_FRAME_INTERVAL_MS;
     }
     if (stop !== 0) {
       running = false;
@@ -2019,11 +2069,6 @@ window.addEventListener("beforeunload", () => {
   }
 });
 
-if ("serviceWorker" in navigator) {
-  window.addEventListener("load", () => {
-    navigator.serviceWorker.register("/sw.js").catch(() => {});
-  });
-}
 
 renderFrame();
 refreshStats();

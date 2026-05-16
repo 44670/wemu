@@ -2338,7 +2338,14 @@ fn ensure_gdi_screen_surface(emu: &mut Emulator) -> u32 {
     if emu.hle.gdi_screen_surface != 0 {
         return emu.hle.gdi_screen_surface;
     }
-    let surf = create_surface(emu, 0).hle();
+    let surf = create_surface_with_format(
+        emu,
+        emu.backend.width().max(1),
+        emu.backend.height().max(1),
+        emu.hle.ddraw_bpp.max(8),
+        0x200,
+    )
+    .hle();
     emu.hle.gdi_screen_surface = surf;
     emu.hle.mark_hle_windows_dirty();
     surf
